@@ -605,7 +605,7 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
 
             if gateway.one_time_auth:
                 # For one-time auth, clear auth_type and auth_value after initialization
-                auth_type = None
+                auth_type = "one_time_auth"
                 auth_value = None
                 oauth_config = None
 
@@ -1270,7 +1270,7 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
 
                         if gateway_update.one_time_auth:
                             # For one-time auth, clear auth_type and auth_value after initialization
-                            gateway.auth_type = None
+                            gateway.auth_type = "one_time_auth"
                             gateway.auth_value = None
                             gateway.oauth_config = None
 
