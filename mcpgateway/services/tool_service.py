@@ -1405,7 +1405,7 @@ class ToolService:
                         tool_call_result = await connect_to_sse_server(tool_gateway.url, headers=headers)
                     elif transport == "streamablehttp":
                         tool_call_result = await connect_to_streamablehttp_server(tool_gateway.url, headers=headers)
-                        
+
                     content = tool_call_result.model_dump(by_alias=True).get("content", [])
 
                     filtered_response = extract_using_jq(content, tool.jsonpath_filter)
