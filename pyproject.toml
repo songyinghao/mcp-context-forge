@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 # ----------------------------------------------------------------
 [project]
 name = "mcp-contextforge-gateway"
-version = "1.0.0-RC-1"
+version = "1.0.0-RC-2"
 description = "ContextForge AI Gateway — an AI gateway, registry, and proxy for MCP, A2A, and REST/gRPC APIs. Exposes a unified control plane with centralized governance, discovery, and observability. Optimizes agent and tool calling, and supports plugins."
 keywords = ["MCP","API","gateway","proxy","tools",
   "agents","agentic ai","model context protocol","multi-agent","fastapi",
@@ -51,7 +51,7 @@ dependencies = [
     "argon2-cffi>=25.1.0",
     "cryptography>=46.0.5",
     "fastapi>=0.135.1",
-    "filelock>=3.25.0",
+    "filelock>=3.25.2",
     "gunicorn>=25.1.0",
     "httpx>=0.28.1",
     "httpx[http2]>=0.28.1",
@@ -68,18 +68,18 @@ dependencies = [
     "pydantic>=2.12.5",
     "pydantic[email]>=2.12.5",
     "pydantic-settings>=2.13.1",
-    "pyjwt>=2.11.0",
+    "pyjwt>=2.12.1",
     "python-json-logger>=4.0.0",
     "python-multipart>=0.0.22", # Transitive pin (mcp, fastapi); dependabot/81
     "PyYAML>=6.0.3",
     "requests-oauthlib>=2.0.0",
     "sqlalchemy>=2.0.48",
-    "sse-starlette>=3.3.2",
+    "sse-starlette>=3.3.3",
     "starlette>=0.52.1",
     "starlette-compress>=1.7.0",
     "typer>=0.24.1",
     "urllib3>=2.6.3", # Transitive pin (requests); dependabot/76
-    "uvicorn[standard]>=0.41.0",
+    "uvicorn[standard]>=0.42.0",
 ]
 
 # ----------------------------------------------------------------
@@ -159,13 +159,15 @@ dev = [
     "vulture>=2.14",
     "websockets>=15.0.1",
     "yamllint>=1.37.1",
-    "pyasn1>=0.6.2", # a2a-sdk; https://github.com/IBM/mcp-context-forge/security/dependabot/73
+    "pyasn1>=0.6.3", # a2a-sdk; https://github.com/IBM/mcp-context-forge/security/dependabot/73
+    "tornado>=6.5.5",  # transitive via jupyter; CVE-2026-31958
     # gRPC plugin framework testing (optional at runtime, required for test coverage)
     "grpcio>=1.76.0",
     "grpcio-reflection>=1.76.0",
     "grpcio-tools>=1.76.0",
     "pipdeptree>=2.31.0",
     "setuptools>=82.0.0",
+    "debugpy>=1.8.20",
 ]
 
 # ----------------------------------------------------------------
@@ -177,12 +179,12 @@ dev = [
 # Redis with hiredis C parser for up to 83x faster response parsing
 # See ADR-026 for benchmarks and decision rationale
 redis = [
-    "redis[hiredis]>=7.2.1",
+    "redis[hiredis]>=7.3.0",
 ]
 
 # Pure-Python Redis parser fallback (for environments where hiredis wheels aren't available)
 redis-pure = [
-    "redis>=7.2.1",
+    "redis>=7.3.0",
 ]
 
 # PostgreSQL adapter with psycopg3
@@ -201,11 +203,11 @@ mariadb = [
 ]
 
 llmchat = [
-    "langchain-core>=1.2.17",
-    "langchain-mcp-adapters>=0.2.1",
+    "langchain-core>=1.2.19",
+    "langchain-mcp-adapters>=0.2.2",
     "langchain-ollama>=1.0.1",
-    "langchain-openai>=1.1.10",
-    "langgraph>=1.0.10",
+    "langchain-openai>=1.1.11",
+    "langgraph>=1.1.2",
 ]
 
 # Fuzzing and property-based testing
@@ -213,7 +215,7 @@ fuzz = [
     "hypothesis>=6.151.9",
     "pytest-benchmark>=5.2.3",
     "pytest-xdist>=3.8.0",
-    "schemathesis>=4.10.2,<4.11.0",  # 4.11.0 requires pytest>=9; pytest-md-report 0.7.0 caps at <9
+    "schemathesis>=4.10.2,<4.11.0", # 4.11.0 requires pytest>=9; pytest-md-report 0.7.0 caps at <9
 ]
 
 # Coverage-guided fuzzing (requires clang/libfuzzer)
@@ -223,10 +225,10 @@ fuzz-atheris = [
 
 # Observability dependencies (optional)
 observability = [
-    "opentelemetry-api>=1.39.1",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.39.1",
-    "opentelemetry-exporter-otlp-proto-http>=1.39.1",
-    "opentelemetry-sdk>=1.39.1",
+    "opentelemetry-api>=1.40.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.40.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.40.0",
+    "opentelemetry-sdk>=1.40.0",
 ]
 
 # Granian HTTP server (optional, alternative to Gunicorn+Uvicorn)
@@ -253,13 +255,13 @@ asyncpg = [
 #        memray flamegraph profile.bin -o flamegraph.html
 # See docs/docs/development/profiling.md for detailed usage
 profiling = [
-    "memray>=1.19.1",
+    "memray>=1.19.2",
     "py-spy>=0.4.1",
 ]
 
 # Plugin templating tools (optional)
 templating = [
-    "cookiecutter>=2.7.0",
+    "cookiecutter>=2.7.1",
 ]
 
 # gRPC Support (EXPERIMENTAL - optional, disabled by default)
@@ -268,7 +270,7 @@ grpc = [
     "grpcio>=1.78.0",
     "grpcio-reflection>=1.78.0",
     "grpcio-tools>=1.78.0",
-    "protobuf>=6.31.1,<7.0.0",  # grpcio-reflection 1.78.x caps at <7.0.0; bump when grpcio ecosystem supports protobuf 7.x
+    "protobuf>=5.29.0,<7.0.0",  # grpcio-reflection 1.78.x caps at <7.0.0
 ]
 
 # UI Testing
@@ -277,6 +279,7 @@ playwright = [
     "pytest-html>=4.2.0",
     "pytest-playwright>=0.7.2",
     "pytest-timeout>=2.4.0",
+    "python-owasp-zap-v2.4>=0.1.0",
 ]
 
 # Convenience meta-extras
@@ -658,6 +661,8 @@ markers = [
     "regression: marks regression tests for previously-fixed bugs",
     "proxy: marks tests that run through a simulated proxy prefix",
     "iframe: marks tests that run inside an iframe host page",
+    "owasp_a01: marks OWASP A01:2021 Broken Access Control security tests",
+    "owasp_a01_zap: marks OWASP A01 ZAP DAST scan tests (requires ZAP daemon; set ZAP_BASE_URL)",
 ]
 
 # Playwright-specific test discovery patterns

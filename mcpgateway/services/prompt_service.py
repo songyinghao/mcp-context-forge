@@ -25,6 +25,10 @@ import uuid
 
 # Third-Party
 from jinja2 import Environment, meta, select_autoescape, Template
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
+import orjson
 from pydantic import ValidationError
 from sqlalchemy import and_, delete, desc, not_, or_, select
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -40,19 +44,24 @@ from mcpgateway.db import Prompt as DbPrompt
 from mcpgateway.db import PromptMetric, PromptMetricsHourly, server_prompt_association
 from mcpgateway.observability import create_span
 from mcpgateway.plugins.framework import get_plugin_manager, GlobalContext, PluginContextTable, PluginManager, PromptHookType, PromptPosthookPayload, PromptPrehookPayload
-from mcpgateway.schemas import PromptCreate, PromptRead, PromptUpdate, TopPerformer
+from mcpgateway.schemas import PromptCreate, PromptMetrics, PromptRead, PromptUpdate, TopPerformer
 from mcpgateway.services.audit_trail_service import get_audit_trail_service
 from mcpgateway.services.base_service import BaseService
 from mcpgateway.services.event_service import EventService
 from mcpgateway.services.logging_service import LoggingService
+from mcpgateway.services.mcp_session_pool import get_mcp_session_pool, TransportType
+from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service
 from mcpgateway.services.metrics_cleanup_service import delete_metrics_in_batches, pause_rollup_during_purge
 from mcpgateway.services.observability_service import current_trace_id, ObservabilityService
 from mcpgateway.services.structured_logger import get_structured_logger
 from mcpgateway.services.team_management_service import TeamManagementService
 from mcpgateway.utils.create_slug import slugify
+from mcpgateway.utils.gateway_access import build_gateway_auth_headers
 from mcpgateway.utils.metrics_common import build_top_performers
 from mcpgateway.utils.pagination import unified_paginate
+from mcpgateway.utils.services_auth import decode_auth
 from mcpgateway.utils.sqlalchemy_modifier import json_contains_tag_expr
+from mcpgateway.utils.url_auth import apply_query_param_auth, sanitize_exception_message
 
 # Cache import (lazy to avoid circular dependencies)
 _REGISTRY_CACHE = None
@@ -109,9 +118,10 @@ def _get_registry_cache():
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
 
-# Initialize structured logger and audit trail for prompt operations
+# Initialize structured logger, audit trail, and metrics buffer for prompt operations
 structured_logger = get_structured_logger("prompt_service")
 audit_trail = get_audit_trail_service()
+metrics_buffer = get_metrics_buffer_service()
 
 
 class PromptError(Exception):
@@ -162,6 +172,41 @@ class PromptValidationError(PromptError):
     """Raised when prompt validation fails."""
 
 
+class PromptArgumentsJSONError(PromptError):
+    """Raised when prompt arguments JSON is invalid.
+
+    Attributes:
+        field_name: Name of the field containing invalid JSON
+        raw_value: First 200 characters of the invalid JSON string
+        json_error: The original JSON parsing error message
+    """
+
+    def __init__(self, field_name: str, json_error: str, raw_value: str = "", context: str = "") -> None:
+        """Initialize the error with JSON parsing details.
+
+        Args:
+            field_name: Name of the field (e.g., "arguments")
+            json_error: The JSON parsing error message
+            raw_value: First 200 characters of the invalid JSON (for logging)
+            context: Optional context about where the error occurred (e.g., "prompt abc-123")
+
+        Examples:
+            >>> from mcpgateway.services.prompt_service import PromptArgumentsJSONError
+            >>> error = PromptArgumentsJSONError("arguments", "unexpected character: line 1 column 5")
+            >>> error.field_name
+            'arguments'
+            >>> str(error)
+            'Invalid JSON in arguments field: unexpected character: line 1 column 5'
+        """
+        self.field_name = field_name
+        self.json_error = json_error
+        self.raw_value = raw_value[:200] if raw_value else ""
+        self.context = context
+        context_str = f" for {context}" if context else ""
+        message = f"Invalid JSON in {field_name} field{context_str}: {json_error}"
+        super().__init__(message)
+
+
 class PromptLockConflictError(PromptError):
     """Raised when a prompt row is locked by another transaction.
 
@@ -205,6 +250,168 @@ class PromptService(BaseService):
         # Use the module-level singleton for template caching
         self._jinja_env = _get_jinja_env()
         self._plugin_manager: PluginManager | None = get_plugin_manager()
+
+    @staticmethod
+    def _should_fetch_gateway_prompt(prompt: DbPrompt) -> bool:
+        """Return whether a prompt must be executed against its source gateway.
+
+        Federated prompts are synced into the catalog as metadata via
+        ``list_prompts()``. Those records often have ``template=""``, which
+        means the gateway must call the upstream MCP ``prompts/get`` endpoint
+        instead of trying to render a local template.
+
+        Args:
+            prompt: Prompt ORM object resolved from the catalog.
+
+        Returns:
+            ``True`` when the prompt is gateway-backed and has no local template.
+        """
+        return bool(getattr(prompt, "gateway_id", None)) and not bool(getattr(prompt, "template", ""))
+
+    async def _fetch_gateway_prompt_result(self, prompt: DbPrompt, arguments: Optional[Dict[str, str]], user_identity: Optional[str]) -> PromptResult:
+        """Fetch a rendered prompt from the upstream MCP gateway.
+
+        Args:
+            prompt: Gateway-backed prompt record from the catalog.
+            arguments: Optional prompt-rendering arguments.
+            user_identity: Effective requester email for session-pool isolation.
+
+        Returns:
+            Prompt result normalized into ContextForge models.
+
+        Raises:
+            PromptError: If the gateway prompt cannot be fetched.
+        """
+        gateway = getattr(prompt, "gateway", None)
+        if gateway is None:
+            raise PromptError(f"Prompt '{prompt.name}' is gateway-backed but missing gateway metadata")
+
+        gateway_url = str(gateway.url)
+        headers = build_gateway_auth_headers(gateway)
+        auth_query_params_decrypted: Optional[Dict[str, str]] = None
+
+        if getattr(gateway, "auth_type", None) == "query_param" and getattr(gateway, "auth_query_params", None):
+            auth_query_params_decrypted = {}
+            for param_key, encrypted_value in (gateway.auth_query_params or {}).items():
+                try:
+                    decoded = decode_auth(encrypted_value)
+                    auth_query_params_decrypted[param_key] = decoded.get(param_key, "")
+                except Exception as exc:
+                    raise PromptError(f"Failed to decode query-parameter auth for prompt gateway '{gateway.id}'") from exc
+            if auth_query_params_decrypted:
+                gateway_url = apply_query_param_auth(gateway_url, auth_query_params_decrypted)
+
+        remote_name = getattr(prompt, "original_name", None) or prompt.name
+        pool_user_identity = (user_identity or "anonymous").strip() or "anonymous"
+        gateway_id = str(getattr(gateway, "id", ""))
+        transport = str(getattr(gateway, "transport", "streamable_http") or "streamable_http").lower()
+        pool_transport_type = TransportType.SSE if transport == "sse" else TransportType.STREAMABLE_HTTP
+        prompt_arguments = arguments or None
+
+        try:
+            if settings.mcp_session_pool_enabled:
+                try:
+                    pool = get_mcp_session_pool()
+                except RuntimeError:
+                    pool = None
+                if pool is not None:
+                    async with pool.session(
+                        url=gateway_url,
+                        headers=headers,
+                        transport_type=pool_transport_type,
+                        user_identity=pool_user_identity,
+                        gateway_id=gateway_id,
+                    ) as pooled:
+                        remote_result = await pooled.session.get_prompt(remote_name, arguments=prompt_arguments)
+                        return PromptResult(
+                            messages=[
+                                Message.model_validate(message.model_dump(by_alias=True, exclude_none=True) if hasattr(message, "model_dump") else message)
+                                for message in getattr(remote_result, "messages", []) or []
+                            ],
+                            description=getattr(remote_result, "description", None) or prompt.description,
+                        )
+
+            if transport == "sse":
+                async with sse_client(url=gateway_url, headers=headers, timeout=settings.health_check_timeout) as streams:
+                    async with ClientSession(*streams) as session:
+                        await session.initialize()
+                        remote_result = await session.get_prompt(remote_name, arguments=prompt_arguments)
+            else:
+                async with streamablehttp_client(url=gateway_url, headers=headers, timeout=settings.health_check_timeout) as (read_stream, write_stream, _get_session_id):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        remote_result = await session.get_prompt(remote_name, arguments=prompt_arguments)
+
+            return PromptResult(
+                messages=[
+                    Message.model_validate(message.model_dump(by_alias=True, exclude_none=True) if hasattr(message, "model_dump") else message)
+                    for message in getattr(remote_result, "messages", []) or []
+                ],
+                description=getattr(remote_result, "description", None) or prompt.description,
+            )
+        except Exception as exc:
+            sanitized_error = sanitize_exception_message(str(exc), auth_query_params_decrypted)
+            raise PromptError(f"Failed to fetch prompt '{remote_name}' from gateway: {sanitized_error}") from exc
+
+    @staticmethod
+    def validate_arguments_json(args_value: Any, context: str = "") -> List[Dict[str, Any]]:
+        """Validate and parse prompt arguments JSON.
+
+        Args:
+            args_value: The raw arguments value from form data
+            context: Additional context for error messages (e.g., "prompt 123", "new prompt")
+
+        Returns:
+            Parsed arguments as a list of dictionaries
+
+        Raises:
+            PromptArgumentsJSONError: If the JSON is invalid
+
+        Examples:
+            >>> from mcpgateway.services.prompt_service import PromptService
+            >>> PromptService.validate_arguments_json('[]')
+            []
+            >>> PromptService.validate_arguments_json('[{"name": "test"}]')
+            [{'name': 'test'}]
+            >>> PromptService.validate_arguments_json(None)
+            []
+            >>> try:
+            ...     PromptService.validate_arguments_json('invalid json')
+            ... except PromptArgumentsJSONError as e:
+            ...     print(e.field_name)
+            arguments
+        """
+        # Handle None or empty values
+        if args_value is None or args_value == "":
+            return []
+
+        # Ensure it's a string
+        if not isinstance(args_value, str):
+            args_value = str(args_value)
+
+        # Strip whitespace
+        args_value = args_value.strip()
+
+        # If still empty after strip, return empty list
+        if not args_value:
+            return []
+
+        # Parse JSON
+        try:
+            arguments = orjson.loads(args_value)
+
+            # Ensure the result is a list (JSON array)
+            if not isinstance(arguments, list):
+                error_msg = f"Arguments must be a JSON array, got {type(arguments).__name__}"
+                logger.error(f"Invalid arguments type{' for ' + context if context else ''}: {error_msg}. " f"Raw value (first 200 chars): {args_value[:200]!r}")
+                raise PromptArgumentsJSONError(field_name="arguments", json_error=error_msg, raw_value=args_value, context=context)
+
+            return arguments
+        except orjson.JSONDecodeError as json_err:
+            # Log the error with context
+            logger.error(f"Invalid JSON in arguments field{' for ' + context if context else ''}: {json_err}. " f"Raw value (first 200 chars): {args_value[:200]!r}")
+            # Raise custom exception
+            raise PromptArgumentsJSONError(field_name="arguments", json_error=str(json_err), raw_value=args_value, context=context) from json_err
 
     async def initialize(self) -> None:
         """Initialize the service."""
@@ -438,22 +645,30 @@ class PromptService(BaseService):
             PromptError: For other prompt registration errors
 
         Examples:
+            >>> import logging
+            >>> logging.disable(logging.CRITICAL)
             >>> from mcpgateway.services.prompt_service import PromptService
-            >>> from unittest.mock import MagicMock
+            >>> from unittest.mock import AsyncMock, MagicMock
             >>> service = PromptService()
             >>> db = MagicMock()
             >>> prompt = MagicMock()
+            >>> prompt.template = "Hello {{ name }}"
+            >>> prompt.name = "test-prompt"
+            >>> prompt.custom_name = None
+            >>> prompt.display_name = None
+            >>> prompt.arguments = []
             >>> db.execute.return_value.scalar_one_or_none.return_value = None
             >>> db.add = MagicMock()
             >>> db.commit = MagicMock()
             >>> db.refresh = MagicMock()
-            >>> service._notify_prompt_added = MagicMock()
+            >>> service._notify_prompt_added = AsyncMock()
             >>> service.convert_prompt_to_read = MagicMock(return_value={})
             >>> import asyncio
             >>> try:
             ...     asyncio.run(service.register_prompt(db, prompt))
             ... except Exception:
             ...     pass
+            >>> logging.disable(logging.NOTSET)
         """
         try:
             # Validate template syntax
@@ -688,16 +903,31 @@ class PromptService(BaseService):
             PromptError: If bulk registration fails critically
 
         Examples:
+            >>> import logging
+            >>> logging.disable(logging.CRITICAL)
             >>> from mcpgateway.services.prompt_service import PromptService
             >>> from unittest.mock import MagicMock
             >>> service = PromptService()
             >>> db = MagicMock()
-            >>> prompts = [MagicMock(), MagicMock()]
+            >>> p1 = MagicMock()
+            >>> p1.name = "prompt-1"
+            >>> p1.template = "Hello"
+            >>> p1.custom_name = None
+            >>> p1.display_name = None
+            >>> p1.arguments = []
+            >>> p2 = MagicMock()
+            >>> p2.name = "prompt-2"
+            >>> p2.template = "World"
+            >>> p2.custom_name = None
+            >>> p2.display_name = None
+            >>> p2.arguments = []
+            >>> prompts = [p1, p2]
             >>> import asyncio
             >>> try:
             ...     result = asyncio.run(service.register_prompts_bulk(db, prompts))
             ... except Exception:
             ...     pass
+            >>> logging.disable(logging.NOTSET)
         """
         if not prompts:
             return {"created": 0, "updated": 0, "skipped": 0, "failed": 0, "errors": []}
@@ -1440,6 +1670,7 @@ class PromptService(BaseService):
         success = False
         error_message = None
         prompt = None
+        server_scoped = False
 
         # Create database span for observability dashboard
         trace_id = current_trace_id.get()
@@ -1520,15 +1751,15 @@ class PromptService(BaseService):
 
                 # Find prompt by ID first, then by name (active prompts only)
                 search_key = str(prompt_id)
-                prompt = db.execute(select(DbPrompt).where(DbPrompt.id == prompt_id).where(DbPrompt.enabled)).scalar_one_or_none()
+                prompt = db.execute(select(DbPrompt).options(joinedload(DbPrompt.gateway)).where(DbPrompt.id == prompt_id).where(DbPrompt.enabled)).scalar_one_or_none()
                 if not prompt:
-                    prompt = db.execute(select(DbPrompt).where(DbPrompt.name == prompt_id).where(DbPrompt.enabled)).scalar_one_or_none()
+                    prompt = db.execute(select(DbPrompt).options(joinedload(DbPrompt.gateway)).where(DbPrompt.name == prompt_id).where(DbPrompt.enabled)).scalar_one_or_none()
 
                 if not prompt:
                     # Check if an inactive prompt exists
-                    inactive_prompt = db.execute(select(DbPrompt).where(DbPrompt.id == prompt_id).where(not_(DbPrompt.enabled))).scalar_one_or_none()
+                    inactive_prompt = db.execute(select(DbPrompt).options(joinedload(DbPrompt.gateway)).where(DbPrompt.id == prompt_id).where(not_(DbPrompt.enabled))).scalar_one_or_none()
                     if not inactive_prompt:
-                        inactive_prompt = db.execute(select(DbPrompt).where(DbPrompt.name == prompt_id).where(not_(DbPrompt.enabled))).scalar_one_or_none()
+                        inactive_prompt = db.execute(select(DbPrompt).options(joinedload(DbPrompt.gateway)).where(DbPrompt.name == prompt_id).where(not_(DbPrompt.enabled))).scalar_one_or_none()
 
                     if inactive_prompt:
                         raise PromptNotFoundError(f"Prompt '{search_key}' exists but is inactive")
@@ -1555,8 +1786,13 @@ class PromptService(BaseService):
                     ).first()
                     if not server_match:
                         raise PromptNotFoundError(f"Prompt not found: {search_key}")
+                    server_scoped = True
 
-                if not arguments:
+                if self._should_fetch_gateway_prompt(prompt):
+                    # Release the read transaction before any remote network I/O.
+                    db.commit()
+                    result = await self._fetch_gateway_prompt_result(prompt, arguments, user)
+                elif not arguments:
                     result = PromptResult(
                         messages=[
                             Message(
@@ -1581,7 +1817,7 @@ class PromptService(BaseService):
                 if has_post_fetch:
                     post_result, _ = await self._plugin_manager.invoke_hook(
                         PromptHookType.PROMPT_POST_FETCH,
-                        payload=PromptPosthookPayload(prompt_id=str(prompt.id), result=result),
+                        payload=PromptPosthookPayload(prompt_id=prompt.name, result=result),
                         global_context=global_context,
                         local_contexts=context_table,
                         violations_as_exceptions=True,
@@ -1644,10 +1880,6 @@ class PromptService(BaseService):
                 # Record metrics only if we found a prompt
                 if prompt:
                     try:
-                        # First-Party
-                        from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service  # pylint: disable=import-outside-toplevel
-
-                        metrics_buffer = get_metrics_buffer_service()
                         metrics_buffer.record_prompt_metric(
                             prompt_id=prompt.id,
                             start_time=start_time,
@@ -1656,6 +1888,21 @@ class PromptService(BaseService):
                         )
                     except Exception as metrics_error:
                         logger.warning(f"Failed to record prompt metric: {metrics_error}")
+
+                    # Record server metrics ONLY when the server scoping check passed.
+                    # This prevents recording metrics with unvalidated server_id values
+                    # from admin API headers (X-Server-ID) or RPC params.
+                    if server_scoped:
+                        try:
+                            # Record server metric only for the specific virtual server being accessed
+                            metrics_buffer.record_server_metric(
+                                server_id=server_id,
+                                start_time=start_time,
+                                success=success,
+                                error_message=error_message,
+                            )
+                        except Exception as metrics_error:
+                            logger.warning(f"Failed to record server metric: {metrics_error}")
 
                 # End database span for observability dashboard
                 if db_span_id and observability_service and not db_span_ended:
@@ -1706,20 +1953,31 @@ class PromptService(BaseService):
             PromptError: For other update errors
 
         Examples:
+            >>> import logging
+            >>> logging.disable(logging.CRITICAL)
             >>> from mcpgateway.services.prompt_service import PromptService
-            >>> from unittest.mock import MagicMock
+            >>> from unittest.mock import AsyncMock, MagicMock
             >>> service = PromptService()
             >>> db = MagicMock()
-            >>> db.execute.return_value.scalar_one_or_none.return_value = MagicMock()
+            >>> existing = MagicMock()
+            >>> existing.custom_name = "test-prompt"
+            >>> existing.name = "test-prompt"
+            >>> existing.gateway = None
+            >>> db.execute.return_value.scalar_one_or_none.return_value = existing
             >>> db.commit = MagicMock()
             >>> db.refresh = MagicMock()
-            >>> service._notify_prompt_updated = MagicMock()
+            >>> service._notify_prompt_updated = AsyncMock()
             >>> service.convert_prompt_to_read = MagicMock(return_value={})
+            >>> update = MagicMock()
+            >>> update.name = None
+            >>> update.visibility = None
+            >>> update.team_id = None
             >>> import asyncio
             >>> try:
-            ...     asyncio.run(service.update_prompt(db, 'prompt_name', MagicMock()))
+            ...     asyncio.run(service.update_prompt(db, 'prompt_name', update))
             ... except Exception:
             ...     pass
+            >>> logging.disable(logging.NOTSET)
         """
         try:
             # Acquire a row-level lock for the prompt being updated to make
@@ -1964,22 +2222,25 @@ class PromptService(BaseService):
             PermissionError: If user doesn't own the prompt.
 
         Examples:
+            >>> import logging
+            >>> logging.disable(logging.CRITICAL)
             >>> from mcpgateway.services.prompt_service import PromptService
-            >>> from unittest.mock import MagicMock
+            >>> from unittest.mock import AsyncMock, MagicMock
             >>> service = PromptService()
             >>> db = MagicMock()
             >>> prompt = MagicMock()
             >>> db.get.return_value = prompt
             >>> db.commit = MagicMock()
             >>> db.refresh = MagicMock()
-            >>> service._notify_prompt_activated = MagicMock()
-            >>> service._notify_prompt_deactivated = MagicMock()
+            >>> service._notify_prompt_activated = AsyncMock()
+            >>> service._notify_prompt_deactivated = AsyncMock()
             >>> service.convert_prompt_to_read = MagicMock(return_value={})
             >>> import asyncio
             >>> try:
-            ...     asyncio.run(service.set_prompt_state(db, 1, True))
+            ...     result = asyncio.run(service.set_prompt_state(db, 1, True))
             ... except Exception:
             ...     pass
+            >>> logging.disable(logging.NOTSET)
         """
         try:
             # Use nowait=True to fail fast if row is locked, preventing lock contention under high load
@@ -2159,20 +2420,23 @@ class PromptService(BaseService):
             Exception: For unexpected errors.
 
         Examples:
+            >>> import logging
+            >>> logging.disable(logging.CRITICAL)
             >>> from mcpgateway.services.prompt_service import PromptService
-            >>> from unittest.mock import MagicMock
+            >>> from unittest.mock import AsyncMock, MagicMock
             >>> service = PromptService()
             >>> db = MagicMock()
             >>> prompt = MagicMock()
             >>> db.get.return_value = prompt
             >>> db.delete = MagicMock()
             >>> db.commit = MagicMock()
-            >>> service._notify_prompt_deleted = MagicMock()
+            >>> service._notify_prompt_deleted = AsyncMock()
             >>> import asyncio
             >>> try:
             ...     asyncio.run(service.delete_prompt(db, '123'))
             ... except Exception:
             ...     pass
+            >>> logging.disable(logging.NOTSET)
         """
         try:
             prompt = db.get(DbPrompt, prompt_id)
@@ -2531,7 +2795,7 @@ class PromptService(BaseService):
         await self._event_service.publish_event(event)
 
     # --- Metrics ---
-    async def aggregate_metrics(self, db: Session) -> Dict[str, Any]:
+    async def aggregate_metrics(self, db: Session) -> PromptMetrics:
         """
         Aggregate metrics for all prompt invocations across all prompts.
 
@@ -2543,7 +2807,7 @@ class PromptService(BaseService):
             db: Database session
 
         Returns:
-            Dict[str, Any]: Aggregated prompt metrics from raw + hourly rollups.
+            PromptMetrics: Aggregated prompt metrics from raw + hourly rollups.
 
         Examples:
             >>> from mcpgateway.services.prompt_service import PromptService
@@ -2559,18 +2823,28 @@ class PromptService(BaseService):
         if is_cache_enabled():
             cached = metrics_cache.get("prompts")
             if cached is not None:
-                return cached
+                return PromptMetrics(**cached)
 
         # Use combined raw + rollup query for full historical coverage
         # First-Party
         from mcpgateway.services.metrics_query_service import aggregate_metrics_combined  # pylint: disable=import-outside-toplevel
 
         result = aggregate_metrics_combined(db, "prompt")
-        metrics = result.to_dict()
 
-        # Cache the result (if enabled)
+        metrics = PromptMetrics(
+            total_executions=result.total_executions,
+            successful_executions=result.successful_executions,
+            failed_executions=result.failed_executions,
+            failure_rate=result.failure_rate,
+            min_response_time=result.min_response_time,
+            max_response_time=result.max_response_time,
+            avg_response_time=result.avg_response_time,
+            last_execution_time=result.last_execution_time,
+        )
+
+        # Cache the result as dict for serialization compatibility (if enabled)
         if is_cache_enabled():
-            metrics_cache.set("prompts", metrics)
+            metrics_cache.set("prompts", metrics.model_dump())
 
         return metrics
 

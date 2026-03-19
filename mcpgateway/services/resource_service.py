@@ -41,7 +41,7 @@ from mcp.client.streamable_http import streamablehttp_client
 import parse
 from pydantic import ValidationError
 from sqlalchemy import and_, delete, desc, not_, or_, select
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, MultipleResultsFound, OperationalError
 from sqlalchemy.orm import joinedload, Session
 
 # First-Party
@@ -62,6 +62,7 @@ from mcpgateway.services.base_service import BaseService
 from mcpgateway.services.event_service import EventService
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.mcp_session_pool import get_mcp_session_pool, TransportType
+from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service
 from mcpgateway.services.metrics_cleanup_service import delete_metrics_in_batches, pause_rollup_during_purge
 from mcpgateway.services.oauth_manager import OAuthManager
 from mcpgateway.services.observability_service import current_trace_id, ObservabilityService
@@ -107,9 +108,10 @@ def _get_registry_cache():
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
 
-# Initialize structured logger and audit trail for resource operations
+# Initialize structured logger, audit trail, and metrics buffer for resource operations
 structured_logger = get_structured_logger("resource_service")
 audit_trail = get_audit_trail_service()
+metrics_buffer = get_metrics_buffer_service()
 
 
 class ResourceError(Exception):
@@ -1368,6 +1370,7 @@ class ResourceService(BaseService):
         meta_data: Optional[Dict[str, Any]] = None,  # Reserved for future MCP SDK support
         resource_obj: Optional[Any] = None,
         gateway_obj: Optional[Any] = None,
+        server_id: Optional[str] = None,
     ) -> Any:
         """
         Invoke a resource via its configured gateway using SSE or StreamableHTTP transport.
@@ -1404,6 +1407,10 @@ class ResourceService(BaseService):
                 Pre-fetched DbResource object to skip the internal resource lookup query.
             gateway_obj (Optional[Any]):
                 Pre-fetched DbGateway object to skip the internal gateway lookup query.
+            server_id (Optional[str]):
+                Virtual server ID for server metrics recording. When provided, indicates
+                the resource was invoked through a specific virtual server endpoint.
+                Direct resource calls (e.g., from admin UI) should pass None.
 
         Returns:
             Any: The text content returned by the remote resource, or ``None`` if the
@@ -1876,37 +1883,24 @@ class ResourceService(BaseService):
                         error_message = str(e)
                         raise
                     finally:
-                        if resource_text:
+                        # Metrics are now recorded only in read_resource finally block
+                        # This eliminates duplicate metrics and provides a single source of truth
+                        # End Invoke resource span for Observability dashboard
+                        # NOTE: Use fresh_db_session() since the original db was released
+                        # before making HTTP calls to prevent connection pool exhaustion
+                        if db_span_id and observability_service and not db_span_ended:
                             try:
-                                # First-Party
-                                from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service  # pylint: disable=import-outside-toplevel
-
-                                metrics_buffer = get_metrics_buffer_service()
-                                metrics_buffer.record_resource_metric(
-                                    resource_id=resource_id,
-                                    start_time=start_time,
-                                    success=success,
-                                    error_message=error_message,
-                                )
-                            except Exception as metrics_error:
-                                logger.warning(f"Failed to invoke resource metric: {metrics_error}")
-
-                            # End Invoke resource span for Observability dashboard
-                            # NOTE: Use fresh_db_session() since the original db was released
-                            # before making HTTP calls to prevent connection pool exhaustion
-                            if db_span_id and observability_service and not db_span_ended:
-                                try:
-                                    with fresh_db_session() as fresh_db:
-                                        observability_service.end_span(
-                                            db=fresh_db,
-                                            span_id=db_span_id,
-                                            status="ok" if success else "error",
-                                            status_message=error_message if error_message else None,
-                                        )
-                                    db_span_ended = True
-                                    logger.debug(f"✓ Ended invoke.resource span: {db_span_id}")
-                                except Exception as e:
-                                    logger.warning(f"Failed to end observability span for invoking resource: {e}")
+                                with fresh_db_session() as fresh_db:
+                                    observability_service.end_span(
+                                        db=fresh_db,
+                                        span_id=db_span_id,
+                                        status="ok" if success else "error",
+                                        status_message=error_message if error_message else None,
+                                    )
+                                db_span_ended = True
+                                logger.debug(f"✓ Ended invoke.resource span: {db_span_id}")
+                            except Exception as e:
+                                logger.warning(f"Failed to end observability span for invoking resource: {e}")
 
     async def read_resource(
         self,
@@ -1990,6 +1984,7 @@ class ResourceService(BaseService):
         success = False
         error_message = None
         resource_db = None
+        server_scoped = False
         resource_db_gateway = None  # Only set when eager-loaded via Q2's joinedload
         content = None
         uri = resource_uri or "unknown"
@@ -2126,10 +2121,27 @@ class ResourceService(BaseService):
                     # Matches uri (modified value from pluggins if applicable)
                     # with uri from resource DB
                     # if uri is of type resource template then resource is retreived from DB
-                    query = select(DbResource).where(DbResource.uri == str(uri)).where(DbResource.enabled)
+                    query = select(DbResource)
+                    if server_id:
+                        query = query.join(
+                            server_resource_association,
+                            server_resource_association.c.resource_id == DbResource.id,
+                        ).where(server_resource_association.c.server_id == server_id)
+                    query = query.where(DbResource.uri == str(uri)).where(DbResource.enabled)
                     if include_inactive:
-                        query = select(DbResource).where(DbResource.uri == str(uri))
-                    resource_db = db.execute(query).scalar_one_or_none()
+                        query = select(DbResource)
+                        if server_id:
+                            query = query.join(
+                                server_resource_association,
+                                server_resource_association.c.resource_id == DbResource.id,
+                            ).where(server_resource_association.c.server_id == server_id)
+                        query = query.where(DbResource.uri == str(uri))
+                    try:
+                        resource_db = db.execute(query).scalar_one_or_none()
+                    except MultipleResultsFound as exc:
+                        if server_id:
+                            raise ResourceError(f"Multiple resources matched URI '{uri}' for server '{server_id}'.") from exc
+                        raise ResourceError(f"Resource URI '{uri}' is ambiguous across multiple servers; use /servers/{{id}}/mcp.") from exc
 
                     # Check for direct_proxy mode
                     if resource_db and resource_db.gateway and getattr(resource_db.gateway, "gateway_mode", "cache") == "direct_proxy" and settings.mcpgateway_direct_proxy_enabled:
@@ -2172,7 +2184,9 @@ class ResourceService(BaseService):
                                         content = TextResourceContents(uri=uri, text="")
 
                                     success = True
-                                    logger.info(f"[READ RESOURCE] Using direct_proxy mode for gateway {gateway.id} (from X-Context-Forge-Gateway-Id header). Meta Attached: {meta_data is not None}")
+                                    logger.info(
+                                        f"[READ RESOURCE] Using direct_proxy mode for gateway {SecurityValidator.sanitize_log_message(gateway.id)} (from X-Context-Forge-Gateway-Id header). Meta Attached: {meta_data is not None}"
+                                    )
                                     # Skip the rest of the DB lookup logic
 
                         except Exception as e:
@@ -2183,8 +2197,23 @@ class ResourceService(BaseService):
                         # Normal cache mode - resource found in DB
                         content = resource_db.content
                     else:
-                        # Check the inactivity first
-                        check_inactivity = db.execute(select(DbResource).where(DbResource.uri == str(resource_uri)).where(not_(DbResource.enabled))).scalar_one_or_none()
+                        # Check the inactivity first using the same server scope that
+                        # governed the active lookup. Without this, duplicate URIs
+                        # across different virtual servers/gateways can produce
+                        # ambiguous results even though the current request is
+                        # already scoped to a single server.
+                        inactive_query = select(DbResource)
+                        if server_id:
+                            inactive_query = inactive_query.join(
+                                server_resource_association,
+                                server_resource_association.c.resource_id == DbResource.id,
+                            ).where(server_resource_association.c.server_id == server_id)
+                        try:
+                            check_inactivity = db.execute(inactive_query.where(DbResource.uri == str(resource_uri)).where(not_(DbResource.enabled))).scalar_one_or_none()
+                        except MultipleResultsFound as exc:
+                            if server_id:
+                                raise ResourceError(f"Multiple inactive resources matched URI '{resource_uri}' for server '{server_id}'.") from exc
+                            raise ResourceError(f"Resource URI '{resource_uri}' is ambiguous across multiple servers; use /servers/{{id}}/mcp.") from exc
                         if check_inactivity:
                             raise ResourceNotFoundError(f"Resource '{resource_uri}' exists but is inactive")
 
@@ -2250,6 +2279,7 @@ class ResourceService(BaseService):
                         ).first()
                         if not server_match:
                             raise ResourceNotFoundError(f"Resource not found: {resource_uri or resource_id}")
+                        server_scoped = True
 
                 # Set success attributes on span
                 if span:
@@ -2275,6 +2305,7 @@ class ResourceService(BaseService):
                 # ResourceContent is the legacy model for backwards compatibility
 
                 if isinstance(content, (ResourceContent, ResourceContents, TextContent)):
+                    # Metrics are recorded in read_resource finally block for all resources
                     resource_response = await self.invoke_resource(
                         db=db,
                         resource_id=getattr(content, "id"),
@@ -2284,11 +2315,13 @@ class ResourceService(BaseService):
                         meta_data=meta_data,
                         resource_obj=resource_db,
                         gateway_obj=resource_db_gateway,
+                        server_id=server_id,
                     )
                     if resource_response:
                         setattr(content, "text", resource_response)
                 # If content is any object that quacks like content
                 elif hasattr(content, "text") or hasattr(content, "blob"):
+                    # Metrics are recorded in read_resource finally block for all resources
                     if hasattr(content, "blob"):
                         resource_response = await self.invoke_resource(
                             db=db,
@@ -2299,6 +2332,7 @@ class ResourceService(BaseService):
                             meta_data=meta_data,
                             resource_obj=resource_db,
                             gateway_obj=resource_db_gateway,
+                            server_id=server_id,
                         )
                         if resource_response:
                             setattr(content, "blob", resource_response)
@@ -2312,6 +2346,7 @@ class ResourceService(BaseService):
                             meta_data=meta_data,
                             resource_obj=resource_db,
                             gateway_obj=resource_db_gateway,
+                            server_id=server_id,
                         )
                         if resource_response:
                             setattr(content, "text", resource_response)
@@ -2340,12 +2375,10 @@ class ResourceService(BaseService):
                 raise
             finally:
                 # Record metrics only if we found a resource (not for templates)
+                logger.debug(f"read_resource finally block: resource_db={'present' if resource_db else None}, resource_id={resource_db.id if resource_db else None}, server_id={server_id}")
+
                 if resource_db:
                     try:
-                        # First-Party
-                        from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service  # pylint: disable=import-outside-toplevel
-
-                        metrics_buffer = get_metrics_buffer_service()
                         metrics_buffer.record_resource_metric(
                             resource_id=resource_db.id,
                             start_time=start_time,
@@ -2354,6 +2387,22 @@ class ResourceService(BaseService):
                         )
                     except Exception as metrics_error:
                         logger.warning(f"Failed to record resource metric: {metrics_error}")
+
+                # Record server metrics ONLY when the server scoping check passed.
+                # This prevents recording metrics with unvalidated server_id values
+                # from admin API headers (X-Server-ID) or RPC params.
+                if resource_db and server_scoped:
+                    try:
+                        logger.debug(f"Recording server metric for server_id={server_id}, resource_id={resource_db.id}, success={success}")
+                        # Record server metric only for the specific virtual server being accessed
+                        metrics_buffer.record_server_metric(
+                            server_id=server_id,
+                            start_time=start_time,
+                            success=success,
+                            error_message=error_message,
+                        )
+                    except Exception as metrics_error:
+                        logger.warning(f"Failed to record server metric: {metrics_error}")
 
                 # End database span for observability dashboard
                 # NOTE: Use fresh_db_session() since db may have been closed by invoke_resource
@@ -3491,6 +3540,7 @@ class ResourceService(BaseService):
         token_teams: Optional[List[str]] = None,
         tags: Optional[List[str]] = None,
         visibility: Optional[str] = None,
+        server_id: Optional[str] = None,
     ) -> List[ResourceTemplate]:
         """
         List resource templates with visibility-based access control.
@@ -3503,6 +3553,7 @@ class ResourceService(BaseService):
                          [] = public-only (no owner access), [...] = team-scoped
             tags (Optional[List[str]]): Filter resources by tags. If provided, only resources with at least one matching tag will be returned.
             visibility (Optional[str]): Filter by visibility (private, team, public).
+            server_id (Optional[str]): Filter by server ID. If provided, only templates associated with this server will be returned.
 
         Returns:
             List of ResourceTemplate objects the user has access to
@@ -3522,6 +3573,10 @@ class ResourceService(BaseService):
             True
         """
         query = select(DbResource).where(DbResource.uri_template.isnot(None))
+
+        # Filter by server_id if provided (same pattern as list_server_resources)
+        if server_id:
+            query = query.join(server_resource_association, DbResource.id == server_resource_association.c.resource_id).where(server_resource_association.c.server_id == server_id)
 
         if not include_inactive:
             query = query.where(DbResource.enabled)
