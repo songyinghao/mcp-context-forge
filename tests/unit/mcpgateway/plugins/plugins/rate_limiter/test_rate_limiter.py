@@ -28,6 +28,7 @@ from mcpgateway.plugins.framework.errors import PluginViolationError
 from mcpgateway.plugins.framework.manager import PluginExecutor
 from mcpgateway.plugins.framework.models import PluginMode
 from plugins.rate_limiter.rate_limiter import (
+    RedisBackend,
     ALGORITHM_FIXED_WINDOW,
     ALGORITHM_SLIDING_WINDOW,
     ALGORITHM_TOKEN_BUCKET,
@@ -1926,15 +1927,12 @@ async def test_two_plugin_instances_different_algorithms_independent():
 
 
 # ---------------------------------------------------------------------------
-# Redis + token_bucket fallback to memory
+# Redis + token_bucket
 # ---------------------------------------------------------------------------
 
 
-def test_token_bucket_with_redis_backend_falls_back_to_memory():
-    """
-    token_bucket is not supported with the Redis backend.
-    The plugin must fall back to MemoryBackend and log a warning rather than crashing.
-    """
+def test_token_bucket_with_redis_backend_uses_redis_backend():
+    """token_bucket with backend=redis instantiates a RedisBackend, not MemoryBackend."""
     plugin = RateLimiterPlugin(
         PluginConfig(
             name="rl",
@@ -1948,6 +1946,54 @@ def test_token_bucket_with_redis_backend_falls_back_to_memory():
             },
         )
     )
-    # Should have fallen back to MemoryBackend with TokenBucketAlgorithm
-    assert isinstance(plugin._rate_backend, MemoryBackend)
-    assert isinstance(plugin._rate_backend._algorithm, TokenBucketAlgorithm)
+    assert isinstance(plugin._rate_backend, RedisBackend)
+    assert plugin._rate_backend._algorithm_name == ALGORITHM_TOKEN_BUCKET
+
+
+@pytest.mark.asyncio
+async def test_redis_token_bucket_enforces_limit():
+    """RedisBackend with token_bucket enforces the limit via the Lua script."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    mock_client = AsyncMock()
+    # First call: allowed=1, remaining=0, time_to_next=0
+    # Second call: allowed=0, remaining=0, time_to_next=5
+    mock_client.eval.side_effect = [
+        [1, 0, 0],
+        [0, 0, 5],
+    ]
+
+    backend = RedisBackend(
+        redis_url="redis://localhost:6379/0",
+        algorithm_name=ALGORITHM_TOKEN_BUCKET,
+        _client=mock_client,
+    )
+
+    allowed1, _, _, meta1 = await backend.allow("user:alice", "1/s")
+    allowed2, _, _, meta2 = await backend.allow("user:alice", "1/s")
+
+    assert allowed1 is True
+    assert meta1["remaining"] == 0
+    assert allowed2 is False
+    assert meta2["remaining"] == 0
+    assert meta2["reset_in"] == 5
+
+
+@pytest.mark.asyncio
+async def test_redis_token_bucket_falls_back_to_memory_on_redis_error():
+    """RedisBackend token_bucket falls back to MemoryBackend when Redis is unavailable."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    mock_client = AsyncMock()
+    mock_client.eval.side_effect = ConnectionError("Redis unavailable")
+
+    fallback = MemoryBackend(TokenBucketAlgorithm())
+    backend = RedisBackend(
+        redis_url="redis://localhost:6379/0",
+        algorithm_name=ALGORITHM_TOKEN_BUCKET,
+        fallback=fallback,
+        _client=mock_client,
+    )
+
+    allowed, _, _, _ = await backend.allow("user:alice", "5/s")
+    assert allowed is True

@@ -9,6 +9,10 @@ Enforces rate limits by user, tenant, and/or tool using a pluggable algorithm:
   - fixed_window  : simple counter per time bucket (default)
   - sliding_window: rolling timestamp log, prevents burst at window boundary
   - token_bucket  : token refill model, allows short controlled bursts
+
+All three algorithms support both memory and Redis backends with identical
+semantics. The Redis backend uses atomic Lua scripts for each algorithm —
+one round-trip per check with no race conditions.
 """
 
 # Future
@@ -374,8 +378,8 @@ class MemoryBackend:
 class RedisBackend:
     """Shared rate limit backend backed by Redis.
 
-    Supports fixed_window and sliding_window algorithms via different Lua scripts.
-    Token bucket is not supported in Redis mode — falls back to memory backend.
+    Supports all three algorithms via atomic Lua scripts — one round-trip per
+    check with no race conditions.
 
     Attributes:
         _url: Redis connection URL.
@@ -395,7 +399,7 @@ return {current, ttl}
 """
 
     # Sliding window: ZADD timestamp, remove old entries, count remaining.
-    # Returns [current_count, oldest_timestamp_ms_or_0].
+    # Returns [current_count, oldest_timestamp_or_0].
     _LUA_SLIDING = """
 local now = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
@@ -408,6 +412,46 @@ local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
 local oldest_ts = 0
 if #oldest > 0 then oldest_ts = tonumber(oldest[2]) end
 return {count, oldest_ts}
+"""
+
+    # Token bucket: HMGET {tokens, last_refill}, refill proportionally, consume 1.
+    # ARGV: [capacity, refill_rate_per_sec, now_as_float]
+    # Returns [allowed_int, remaining_floor, time_to_next_token_seconds].
+    _LUA_TOKEN_BUCKET = """
+local data = redis.call('HMGET', KEYS[1], 'tokens', 'last_refill')
+local capacity = tonumber(ARGV[1])
+local rate     = tonumber(ARGV[2])
+local now      = tonumber(ARGV[3])
+
+local tokens      = tonumber(data[1])
+local last_refill = tonumber(data[2])
+
+if tokens == nil then
+    tokens = capacity - 1
+    redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill', now)
+    local ttl = math.ceil(capacity / rate) + 1
+    redis.call('EXPIRE', KEYS[1], ttl)
+    return {1, math.floor(tokens), 0}
+end
+
+local elapsed = now - last_refill
+tokens = math.min(capacity, tokens + elapsed * rate)
+
+local allowed
+local time_to_next = 0
+if tokens >= 1.0 then
+    tokens  = tokens - 1.0
+    allowed = 1
+else
+    allowed      = 0
+    time_to_next = math.ceil((1.0 - tokens) / rate)
+end
+
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill', now)
+local ttl = math.ceil((capacity - tokens) / rate) + 1
+redis.call('EXPIRE', KEYS[1], ttl)
+
+return {allowed, math.floor(tokens), time_to_next}
 """
 
     def __init__(
@@ -445,7 +489,8 @@ return {count, oldest_ts}
 
             if self._algorithm_name == ALGORITHM_SLIDING_WINDOW:
                 return await self._allow_sliding(client, redis_key, count, window_seconds)
-            # fixed_window (token_bucket not supported in Redis — handled at init)
+            if self._algorithm_name == ALGORITHM_TOKEN_BUCKET:
+                return await self._allow_token_bucket(client, redis_key, count, window_seconds)
             return await self._allow_fixed(client, redis_key, count, window_seconds)
 
         except Exception:
@@ -479,6 +524,19 @@ return {count, oldest_ts}
         if current_count > count:
             return False, count, reset_timestamp, {"limited": True, "remaining": 0, "reset_in": reset_in}
         return True, count, reset_timestamp, {"limited": True, "remaining": remaining, "reset_in": reset_in}
+
+    async def _allow_token_bucket(self, client: Any, redis_key: str, count: int, window_seconds: int) -> tuple[bool, int, int, dict[str, Any]]:
+        now = time.time()
+        refill_rate = count / window_seconds  # tokens per second
+        result = await client.eval(self._LUA_TOKEN_BUCKET, 1, redis_key, count, refill_rate, now)
+        allowed_int = int(result[0])
+        remaining = int(result[1])
+        time_to_next = int(result[2])
+        reset_timestamp = int(now + (time_to_next if not allowed_int else window_seconds))
+
+        if not allowed_int:
+            return False, count, reset_timestamp, {"limited": True, "remaining": 0, "reset_in": time_to_next}
+        return True, count, reset_timestamp, {"limited": True, "remaining": remaining, "reset_in": window_seconds}
 
 
 # ---------------------------------------------------------------------------
@@ -526,23 +584,13 @@ class RateLimiterPlugin(Plugin):
         algorithm = _make_algorithm(self._cfg.algorithm)
 
         if self._cfg.backend == "redis":
-            if self._cfg.algorithm == ALGORITHM_TOKEN_BUCKET:
-                # Token bucket in Redis requires per-key refill-rate metadata that
-                # complicates the Lua script significantly. Fall back to memory backend
-                # for token_bucket and log a notice so operators are aware.
-                logger.warning(
-                    "RateLimiterPlugin: token_bucket algorithm is not supported with the Redis backend. "
-                    "Falling back to memory backend for rate limiting. Use fixed_window or sliding_window with Redis."
-                )
-                self._rate_backend: MemoryBackend | RedisBackend = MemoryBackend(algorithm)
-            else:
-                fallback_backend = MemoryBackend(_make_algorithm(self._cfg.algorithm)) if self._cfg.redis_fallback else None
-                self._rate_backend = RedisBackend(
-                    redis_url=self._cfg.redis_url or "redis://localhost:6379/0",
-                    key_prefix=self._cfg.redis_key_prefix,
-                    algorithm_name=self._cfg.algorithm,
-                    fallback=fallback_backend,
-                )
+            fallback_backend = MemoryBackend(_make_algorithm(self._cfg.algorithm)) if self._cfg.redis_fallback else None
+            self._rate_backend: MemoryBackend | RedisBackend = RedisBackend(
+                redis_url=self._cfg.redis_url or "redis://localhost:6379/0",
+                key_prefix=self._cfg.redis_key_prefix,
+                algorithm_name=self._cfg.algorithm,
+                fallback=fallback_backend,
+            )
         else:
             self._rate_backend = MemoryBackend(algorithm)
 
