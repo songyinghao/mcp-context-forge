@@ -2418,3 +2418,412 @@ def test_by_tool_with_special_character_tool_names():
     assert "my tool/v2" in plugin._cfg.by_tool
     assert "outil-résumé" in plugin._cfg.by_tool
     assert "工具" in plugin._cfg.by_tool
+
+
+# ============================================================================
+# P0 Unit Tests — Redis/Memory Correctness
+# ============================================================================
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Bug: _LUA_SLIDING uses ZADD key score member where both score and member "
+        "are the same float timestamp. Redis ZADD with duplicate member overwrites "
+        "the existing entry, collapsing N requests at the same timestamp into 1. "
+        "Fix: use a unique member per request (e.g. UUID or counter suffix) so "
+        "each request occupies its own sorted-set slot regardless of timestamp."
+    ),
+)
+@pytest.mark.asyncio
+async def test_redis_sliding_window_counts_multiple_requests_with_same_timestamp():
+    """
+    The sliding window Lua script calls ZADD key now now — timestamp is both
+    score and member. Two requests at the same float second produce only one
+    sorted-set entry, under-counting requests and allowing more than the limit.
+
+    This test sends 3 requests at an identical mocked timestamp against a limit
+    of 2/s and expects all 3 to be counted. It currently fails due to the bug.
+    """
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    fixed_ts = 1_700_000_000.0
+
+    # Simulate Redis sorted-set behaviour: ZADD score member — duplicate member overwrites
+    store: dict[str, dict] = {}
+
+    async def fake_eval(script, numkeys, key, *args):
+        if "ZREMRANGEBYSCORE" in script:
+            # Sliding window Lua
+            now = float(args[0])
+            window = float(args[1])
+            cutoff = now - window
+            if key not in store:
+                store[key] = {}
+            # Evict old entries
+            store[key] = {m: s for m, s in store[key].items() if s > cutoff}
+            # ZADD: member = str(now), score = now — duplicate member overwrites
+            store[key][str(now)] = now
+            count = len(store[key])
+            oldest_ts = min(store[key].values()) if store[key] else 0
+            return [count, oldest_ts]
+        return [0, 0]
+
+    mock_client = AsyncMock()
+    mock_client.eval.side_effect = fake_eval
+
+    backend = RedisBackend(
+        redis_url="redis://localhost:6379/0",
+        algorithm_name=ALGORITHM_SLIDING_WINDOW,
+        fallback=None,
+        _client=mock_client,
+    )
+
+    limit = "2/s"
+    with patch("plugins.rate_limiter.rate_limiter.time") as mock_time:
+        mock_time.time.return_value = fixed_ts
+        r1, *_ = await backend.allow("user:test", limit)
+        r2, *_ = await backend.allow("user:test", limit)
+        r3, *_ = await backend.allow("user:test", limit)
+
+    # All 3 requests share the same timestamp — with the bug only 1 entry exists
+    # so all 3 are allowed. Correct behaviour: 3rd should be blocked.
+    assert r3 is False, (
+        "Third request at same timestamp must be blocked — "
+        "each request must occupy its own sorted-set slot"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sliding_window_memory_evicts_idle_keys_after_window_expires():
+    """
+    When a sliding window key has no activity for longer than the window duration,
+    the next allow() call must naturally evict stale timestamps and treat the key
+    as fresh — allowing requests up to the full limit again.
+
+    This tests the natural eviction path via allow() itself, not the sweep task.
+    """
+    algorithm = SlidingWindowAlgorithm()
+    lock = asyncio.Lock()
+    now = time.time()
+
+    with patch("plugins.rate_limiter.rate_limiter.time") as mock_time:
+        # Exhaust the limit now
+        mock_time.time.return_value = now
+        await algorithm.allow(lock, "user:test", 2, 1)
+        await algorithm.allow(lock, "user:test", 2, 1)
+        blocked, *_ = await algorithm.allow(lock, "user:test", 2, 1)
+        assert blocked is False
+
+        # Advance time past the window — all previous timestamps are now stale
+        mock_time.time.return_value = now + 2.0
+
+        # Next call must see an empty window and allow the request
+        allowed, *_ = await algorithm.allow(lock, "user:test", 2, 1)
+        assert allowed is True, (
+            "After window expires, allow() must evict stale timestamps and allow fresh requests"
+        )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Bug: _LUA_SLIDING unconditionally calls ZADD before checking the count. "
+        "This means blocked requests add their timestamp to the sorted set, inflating "
+        "the window count and causing over-blocking on subsequent requests compared to "
+        "the memory backend (which only records timestamps for allowed requests). "
+        "Fix: check count against limit BEFORE ZADD, and only insert if allowed."
+    ),
+)
+@pytest.mark.asyncio
+async def test_memory_and_redis_sliding_window_have_same_allow_block_sequence():
+    """
+    Memory backend and Redis backend must produce identical allow/block decisions
+    for the same request timeline. This parity test uses an in-process Redis
+    simulator that faithfully implements the sliding window Lua script logic,
+    ensuring divergences between the Python algorithm and the Lua script are caught.
+    """
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    # In-process Redis simulator for sliding window
+    sim_store: dict[str, dict] = {}
+    request_counter = [0]  # unique member suffix to avoid ZADD collision
+
+    async def sliding_sim(script, numkeys, key, *args):
+        now = float(args[0])
+        window = float(args[1])
+        cutoff = now - window
+        if key not in sim_store:
+            sim_store[key] = {}
+        sim_store[key] = {m: s for m, s in sim_store[key].items() if s > cutoff}
+        # Use unique member per request (correct fix — unlike the current Lua bug)
+        request_counter[0] += 1
+        sim_store[key][f"{now}:{request_counter[0]}"] = now
+        count = len(sim_store[key])
+        oldest_ts = min(sim_store[key].values()) if sim_store[key] else now
+        return [count, oldest_ts]
+
+    mock_client = AsyncMock()
+    mock_client.eval.side_effect = sliding_sim
+
+    redis_backend = RedisBackend(
+        redis_url="redis://localhost:6379/0",
+        algorithm_name=ALGORITHM_SLIDING_WINDOW,
+        fallback=None,
+        _client=mock_client,
+    )
+    memory_backend = MemoryBackend(SlidingWindowAlgorithm())
+
+    limit = "3/s"
+    base = time.time()
+    offsets = [0.0, 0.1, 0.2, 0.5, 0.8, 1.1, 1.2, 1.5]
+
+    redis_decisions = []
+    memory_decisions = []
+
+    for offset in offsets:
+        t = base + offset
+        with patch("plugins.rate_limiter.rate_limiter.time") as mock_time:
+            mock_time.time.return_value = t
+            r_allowed, *_ = await redis_backend.allow("user:test", limit)
+            m_allowed, *_ = await memory_backend.allow("user:test", limit)
+        redis_decisions.append(r_allowed)
+        memory_decisions.append(m_allowed)
+
+    assert redis_decisions == memory_decisions, (
+        f"Memory and Redis sliding window diverged:\n"
+        f"  Redis:  {redis_decisions}\n"
+        f"  Memory: {memory_decisions}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_and_redis_token_bucket_have_same_allow_block_sequence():
+    """
+    Memory backend and Redis backend must produce identical allow/block decisions
+    for the token bucket algorithm across a fixed request timeline.
+    Uses an in-process simulator of the token bucket Lua script.
+    """
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    # In-process Redis simulator for token bucket
+    sim_bucket: dict[str, dict] = {}
+
+    async def token_bucket_sim(script, numkeys, key, *args):
+        capacity = float(args[0])
+        rate = float(args[1])
+        now = float(args[2])
+
+        if key not in sim_bucket:
+            tokens = capacity - 1
+            sim_bucket[key] = {"tokens": tokens, "last_refill": now}
+            return [1, int(tokens), 0]
+
+        b = sim_bucket[key]
+        elapsed = now - b["last_refill"]
+        tokens = min(capacity, b["tokens"] + elapsed * rate)
+
+        if tokens >= 1.0:
+            tokens -= 1.0
+            allowed = 1
+            time_to_next = 0
+        else:
+            allowed = 0
+            time_to_next = int((1.0 - tokens) / rate) + 1
+
+        sim_bucket[key] = {"tokens": tokens, "last_refill": now}
+        return [allowed, int(tokens), time_to_next]
+
+    mock_client = AsyncMock()
+    mock_client.eval.side_effect = token_bucket_sim
+
+    redis_backend = RedisBackend(
+        redis_url="redis://localhost:6379/0",
+        algorithm_name=ALGORITHM_TOKEN_BUCKET,
+        fallback=None,
+        _client=mock_client,
+    )
+    memory_backend = MemoryBackend(TokenBucketAlgorithm())
+
+    limit = "3/s"
+    base = time.time()
+    offsets = [0.0, 0.1, 0.2, 0.4, 0.8, 1.0, 1.2, 1.6, 2.0]
+
+    redis_decisions = []
+    memory_decisions = []
+
+    for offset in offsets:
+        t = base + offset
+        with patch("plugins.rate_limiter.rate_limiter.time") as mock_time:
+            mock_time.time.return_value = t
+            r_allowed, *_ = await redis_backend.allow("user:test", limit)
+            m_allowed, *_ = await memory_backend.allow("user:test", limit)
+        redis_decisions.append(r_allowed)
+        memory_decisions.append(m_allowed)
+
+    assert redis_decisions == memory_decisions, (
+        f"Memory and Redis token bucket diverged:\n"
+        f"  Redis:  {redis_decisions}\n"
+        f"  Memory: {memory_decisions}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1 Unit Tests — header consistency and correctness
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_token_bucket_success_headers_are_consistent_between_memory_and_redis():
+    """
+    For allowed token bucket requests, both memory and Redis backends must
+    produce the same X-RateLimit-Remaining value and X-RateLimit-Limit == configured limit.
+    """
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    sim_bucket: dict[str, dict] = {}
+
+    async def token_bucket_sim(script, numkeys, key, *args):
+        capacity = float(args[0])
+        rate = float(args[1])
+        now = float(args[2])
+        if key not in sim_bucket:
+            tokens = capacity - 1
+            sim_bucket[key] = {"tokens": tokens, "last_refill": now}
+            return [1, int(tokens), 0]
+        b = sim_bucket[key]
+        elapsed = now - b["last_refill"]
+        tokens = min(capacity, b["tokens"] + elapsed * rate)
+        if tokens >= 1.0:
+            tokens -= 1.0
+            allowed = 1
+            time_to_next = 0
+        else:
+            allowed = 0
+            time_to_next = int((1.0 - tokens) / rate) + 1
+        sim_bucket[key] = {"tokens": tokens, "last_refill": now}
+        return [allowed, int(tokens), time_to_next]
+
+    mock_client = AsyncMock()
+    mock_client.eval.side_effect = token_bucket_sim
+
+    limit = "5/s"
+    t0 = time.time()
+
+    memory_backend = MemoryBackend(TokenBucketAlgorithm())
+    redis_backend = RedisBackend(
+        redis_url="redis://localhost:6379/0",
+        algorithm_name=ALGORITHM_TOKEN_BUCKET,
+        fallback=None,
+        _client=mock_client,
+    )
+
+    with patch("plugins.rate_limiter.rate_limiter.time") as mock_time:
+        mock_time.time.return_value = t0
+        m_allowed, m_limit, m_reset, m_meta = await memory_backend.allow("user:x", limit)
+        r_allowed, r_limit, r_reset, r_meta = await redis_backend.allow("user:x", limit)
+
+    assert m_allowed is True
+    assert r_allowed is True
+    # Both must report the configured limit
+    assert m_limit == 5
+    assert r_limit == 5
+    # Remaining should be 4 (one token consumed from a full bucket of 5)
+    m_remaining = m_meta.get("remaining", 0)
+    r_remaining = r_meta.get("remaining", 0)
+    assert m_remaining == 4
+    assert r_remaining == 4
+    # Reset timestamp should be >= now
+    assert m_reset >= t0
+    assert r_reset >= t0
+
+
+@pytest.mark.asyncio
+async def test_sliding_window_reset_header_tracks_oldest_request_expiry():
+    """
+    For sliding_window, X-RateLimit-Reset must equal the timestamp of the
+    oldest request in the current window plus the window duration — i.e.
+    when that request ages out and a new slot opens.
+    """
+    plugin = _mk("3/s", ALGORITHM_SLIDING_WINDOW)
+    ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="u1"))
+    payload = ToolPreInvokePayload(name="t", arguments={})
+    t0 = 1_000_000.0
+
+    # First request at t0
+    with patch("plugins.rate_limiter.rate_limiter.time") as mt:
+        mt.time.return_value = t0
+        r1 = await plugin.tool_pre_invoke(payload, ctx)
+    assert r1.violation is None
+    reset_after_first = (r1.http_headers or {}).get("X-RateLimit-Reset")
+    assert reset_after_first is not None
+    # Reset should be t0 + 1s (window = 1s, oldest entry = t0)
+    assert float(reset_after_first) == pytest.approx(t0 + 1.0, abs=0.1)
+
+    # Second request at t0 + 0.3s — oldest is still t0
+    with patch("plugins.rate_limiter.rate_limiter.time") as mt:
+        mt.time.return_value = t0 + 0.3
+        r2 = await plugin.tool_pre_invoke(payload, ctx)
+    assert r2.violation is None
+    reset_after_second = (r2.http_headers or {}).get("X-RateLimit-Reset")
+    # Reset still anchored to t0 (oldest request)
+    assert float(reset_after_second) == pytest.approx(t0 + 1.0, abs=0.1)
+
+
+@pytest.mark.asyncio
+async def test_token_bucket_retry_after_matches_time_to_next_token():
+    """
+    When a token bucket request is blocked, Retry-After must be > 0 and
+    reflect the time until the next token is available (roughly 1/rate seconds).
+    """
+    plugin = _mk("2/s", ALGORITHM_TOKEN_BUCKET)
+    ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="u1"))
+    payload = ToolPreInvokePayload(name="t", arguments={})
+    t0 = 1_000_000.0
+
+    # Exhaust both tokens
+    with patch("plugins.rate_limiter.rate_limiter.time") as mt:
+        mt.time.return_value = t0
+        r1 = await plugin.tool_pre_invoke(payload, ctx)
+        r2 = await plugin.tool_pre_invoke(payload, ctx)
+    assert r1.violation is None
+    assert r2.violation is None
+
+    # Third request at same instant — bucket empty
+    with patch("plugins.rate_limiter.rate_limiter.time") as mt:
+        mt.time.return_value = t0
+        r3 = await plugin.tool_pre_invoke(payload, ctx)
+    assert r3.violation is not None
+    retry_after = (r3.violation.http_headers or {}).get("Retry-After")
+    assert retry_after is not None
+    retry_secs = int(retry_after)
+    # With rate 2/s, one token refills in 0.5s — Retry-After should be 1s (integer ceiling)
+    assert 1 <= retry_secs <= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("algorithm", [ALGORITHM_FIXED_WINDOW, ALGORITHM_SLIDING_WINDOW, ALGORITHM_TOKEN_BUCKET])
+async def test_remaining_header_never_goes_negative_for_any_algorithm(algorithm: str):
+    """
+    X-RateLimit-Remaining must never be negative, regardless of algorithm,
+    even when requests arrive after the limit is exhausted.
+    """
+    plugin = _mk("2/s", algorithm)
+    ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="u1"))
+    payload = ToolPreInvokePayload(name="t", arguments={})
+    t0 = 1_000_000.0
+
+    for _ in range(5):  # send 5 requests against a limit of 2
+        with patch("plugins.rate_limiter.rate_limiter.time") as mt:
+            mt.time.return_value = t0
+            result = await plugin.tool_pre_invoke(payload, ctx)
+        # Headers are on result.http_headers for allowed requests,
+        # and on result.violation.http_headers for blocked requests.
+        if result.violation is not None:
+            headers = result.violation.http_headers or {}
+        else:
+            headers = result.http_headers or {}
+        remaining_str = headers.get("X-RateLimit-Remaining")
+        assert remaining_str is not None, "X-RateLimit-Remaining header must always be present"
+        remaining = int(remaining_str)
+        assert remaining >= 0, f"Remaining went negative ({remaining}) for algorithm={algorithm}"
