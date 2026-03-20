@@ -20,7 +20,7 @@ from __future__ import annotations
 
 # Standard
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -201,9 +201,11 @@ class FixedWindowAlgorithm:
     """
 
     def __init__(self) -> None:
+        """Initialise with an empty window store."""
         self._store: Dict[str, _Window] = {}
 
     async def allow(self, lock: asyncio.Lock, key: str, count: int, window: int) -> Tuple[bool, int, int, Dict[str, Any]]:
+        """Check and increment the fixed-window counter for *key*."""
         now = int(time.time())
         win_key = f"{key}:{window}"
 
@@ -243,9 +245,11 @@ class SlidingWindowAlgorithm:
     """
 
     def __init__(self) -> None:
+        """Initialise with an empty timestamp store."""
         self._store: Dict[str, List[float]] = {}
 
     async def allow(self, lock: asyncio.Lock, key: str, count: int, window: int) -> Tuple[bool, int, int, Dict[str, Any]]:
+        """Check the sliding-window log for *key* and record the request if allowed."""
         now = time.time()
         cutoff = now - window
 
@@ -269,7 +273,6 @@ class SlidingWindowAlgorithm:
 
     async def sweep(self, lock: asyncio.Lock) -> None:
         """Evict keys whose timestamp list is empty (no recent requests)."""
-        now = time.time()
         async with lock:
             # We don't know window per key here — just remove empty lists
             # (full eviction happens naturally as timestamps age out on next allow())
@@ -290,9 +293,11 @@ class TokenBucketAlgorithm:
     """
 
     def __init__(self) -> None:
+        """Initialise with an empty bucket store."""
         self._store: Dict[str, _Bucket] = {}
 
     async def allow(self, lock: asyncio.Lock, key: str, count: int, window: int) -> Tuple[bool, int, int, Dict[str, Any]]:
+        """Consume one token from *key*'s bucket, refilling proportionally to elapsed time."""
         now = time.time()
         refill_rate = count / window  # tokens per second
 
@@ -331,8 +336,6 @@ class TokenBucketAlgorithm:
             now = time.time()
             full = []
             for k, bucket in self._store.items():
-                # Estimate current tokens
-                refill_rate_approx = 1.0  # we don't store count/window here — just evict old
                 elapsed = now - bucket.last_refill
                 if elapsed > 3600:  # inactive for over an hour
                     full.append(k)
@@ -387,6 +390,7 @@ class MemoryBackend:
             await self._algorithm.sweep(self._lock)
 
     async def allow(self, key: str, limit: Optional[str]) -> tuple[bool, int, int, dict[str, Any]]:
+        """Check the rate limit for *key* against *limit* using the in-process algorithm."""
         self._ensure_sweep_task()
         if not limit:
             return True, 0, 0, {"limited": False}
@@ -510,6 +514,7 @@ return {allowed, math.floor(tokens), time_to_next}
         return self._real_client
 
     async def allow(self, key: str, limit: Optional[str]) -> tuple[bool, int, int, dict[str, Any]]:
+        """Check the rate limit for *key* against *limit* using an atomic Redis Lua script."""
         if not limit:
             return True, 0, 0, {"limited": False}
 
@@ -652,6 +657,7 @@ class RateLimiterPlugin(Plugin):
             raise ValueError("RateLimiterPlugin config errors: " + "; ".join(errors))
 
     async def prompt_pre_fetch(self, payload: PromptPrehookPayload, context: PluginContext) -> PromptPrehookResult:
+        """Enforce rate limits before a prompt is fetched."""
         try:
             prompt = payload.prompt_id
             user = _extract_user_identity(context.global_context.user)
@@ -694,6 +700,7 @@ class RateLimiterPlugin(Plugin):
             return PromptPrehookResult()
 
     async def tool_pre_invoke(self, payload: ToolPreInvokePayload, context: PluginContext) -> ToolPreInvokeResult:
+        """Enforce rate limits before a tool is invoked."""
         try:
             tool = payload.name.strip().lower()
             user = _extract_user_identity(context.global_context.user)
