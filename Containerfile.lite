@@ -69,7 +69,7 @@ COPY tools_rust/mcp_runtime/ /build/tools_rust/mcp_runtime/
 RUN if [ "$ENABLE_RUST" = "true" ]; then \
         mkdir -p /build/rust-wheels && \
         /opt/python/cp312-cp312/bin/python -m pip install --upgrade pip maturin && \
-        for plugin_dir in /build/plugins_rust/*/; do \
+        for plugin_dir in "/build/plugins_rust/"*/; do \
             if [ -f "$plugin_dir/Cargo.toml" ]; then \
                 plugin_name=$(basename "$plugin_dir"); \
                 echo "🦀 Building Rust plugin: $plugin_name"; \
@@ -171,15 +171,15 @@ RUN set -euo pipefail \
     && if [ "$(uname -m)" = "s390x" ]; then \
         echo "📦 Installing dependencies for s390x architecture..."; \
         dnf install -y libpq-devel 2>/dev/null || true; \
-        /app/.venv/bin/pip install --no-cache-dir ".[redis,mysql,observability,granian]" \
+        /app/.venv/bin/pip install --no-cache-dir ".[redis,observability]" \
         && (/app/.venv/bin/pip install --no-cache-dir "psycopg[c]>=3.3.3" \
             || /app/.venv/bin/pip install --no-cache-dir "psycopg>=3.3.3"); \
     else \
-        /app/.venv/bin/uv pip install ".[redis,postgres,mysql,observability,granian]"; \
+        /app/.venv/bin/uv pip install ".[redis,postgres,observability]"; \
     fi \
-    && if [ "$ENABLE_RUST" = "true" ] && ls /tmp/rust-wheels/*.whl 1> /dev/null 2>&1; then \
+    && if [ "$ENABLE_RUST" = "true" ] && ls "/tmp/rust-wheels/"*.whl 1> /dev/null 2>&1; then \
         echo "🦀 Installing Rust plugins..."; \
-        /app/.venv/bin/python3 -m pip install /tmp/rust-wheels/*.whl && \
+        /app/.venv/bin/python3 -m pip install "/tmp/rust-wheels/"*.whl && \
         /app/.venv/bin/python3 -c "from pii_filter_rust.pii_filter_rust import PIIDetectorRust; print('✓ Rust PII filter installed successfully')"; \
     else \
         echo "⏭️  Rust plugins not available - using Python implementations"; \
@@ -198,13 +198,13 @@ RUN set -euo pipefail \
         \( -name "pip-*" -o -name "setuptools-*" -o -name "wheel-*" -o -name "pdm-*" -o -name "uv-*" \) \
         -exec rm -rf {} + 2>/dev/null || true \
     && rm -rf /app/.venv/share/python-wheels \
-    && rm -rf /app/*.egg-info /app/build /app/dist /app/.eggs
+    && rm -rf "/app/"*.egg-info /app/build /app/dist /app/.eggs
 
 # ----------------------------------------------------------------------------
 # Now copy only the application files needed for runtime
 # This ensures code changes don't invalidate the dependency layer
 # ----------------------------------------------------------------------------
-COPY run-gunicorn.sh run-granian.sh docker-entrypoint.sh /app/
+COPY run-gunicorn.sh docker-entrypoint.sh /app/
 COPY mcpgateway/ /app/mcpgateway/
 COPY gunicorn.config.py /app/
 COPY plugins/ /app/plugins/
@@ -225,7 +225,7 @@ RUN chmod +x /tmp/download-cdn-assets.sh \
 # ----------------------------------------------------------------------------
 # Ensure executable permissions for scripts
 # ----------------------------------------------------------------------------
-RUN chmod +x /app/run-gunicorn.sh /app/run-granian.sh /app/run.sh
+RUN chmod +x /app/run-gunicorn.sh /app/run.sh
 
 # ----------------------------------------------------------------------------
 # Pre-compile Python bytecode with -OO optimization
@@ -353,10 +353,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 # ----------------------------------------------------------------------------
 # HTTP server selection via HTTP_SERVER environment variable:
 #   - gunicorn : Python-based with Uvicorn workers (default)
-#   - granian  : Rust-based HTTP server (alternative)
 #
 # Examples:
 #   docker run -e HTTP_SERVER=gunicorn mcpgateway  # Default
-#   docker run -e HTTP_SERVER=granian mcpgateway   # Alternative
 ENV HTTP_SERVER=gunicorn
 CMD ["./docker-entrypoint.sh"]
