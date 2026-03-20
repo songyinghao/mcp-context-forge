@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
 
 # Third-Party
 from pydantic import BaseModel, Field
@@ -102,6 +103,24 @@ def _make_headers(limit: int, remaining: int, reset_timestamp: int, retry_after:
     if include_retry_after:
         headers["Retry-After"] = str(retry_after)
     return headers
+
+
+def _extract_user_identity(user: Any) -> str:
+    """Return a stable, normalised string identity from a user context value.
+
+    Handles three cases:
+    - dict (production JWT context): extract ``email`` → ``id`` → ``sub`` fallback
+    - string: strip whitespace; empty/whitespace-only falls back to 'anonymous'
+    - None / falsy: 'anonymous'
+    """
+    if isinstance(user, dict):
+        identity = user.get("email") or user.get("id") or user.get("sub") or ""
+        identity = str(identity).strip()
+    elif user is None:
+        identity = ""
+    else:
+        identity = str(user).strip()
+    return identity if identity else "anonymous"
 
 
 def _select_most_restrictive(
@@ -398,20 +417,33 @@ local ttl = redis.call('TTL', KEYS[1])
 return {current, ttl}
 """
 
-    # Sliding window: ZADD timestamp, remove old entries, count remaining.
-    # Returns [current_count, oldest_timestamp_or_0].
+    # Sliding window: remove expired entries, check count, ZADD only if allowed.
+    # ARGV: [now_float, window_seconds, limit_int, unique_member]
+    # Returns [allowed_int, current_count, oldest_timestamp_or_0].
+    # Fix: check count before ZADD (blocked requests must not inflate the set).
+    # Fix: use a unique member (ARGV[4]) so simultaneous requests with identical
+    #      timestamps do not collapse into a single sorted-set entry.
     _LUA_SLIDING = """
 local now = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local member = ARGV[4]
 local cutoff = now - window
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', cutoff)
-redis.call('ZADD', KEYS[1], now, now)
+local count = tonumber(redis.call('ZCARD', KEYS[1]))
 redis.call('EXPIRE', KEYS[1], window + 1)
-local count = redis.call('ZCARD', KEYS[1])
 local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
 local oldest_ts = 0
 if #oldest > 0 then oldest_ts = tonumber(oldest[2]) end
-return {count, oldest_ts}
+if count >= limit then
+    return {0, count, oldest_ts}
+end
+redis.call('ZADD', KEYS[1], now, member)
+count = count + 1
+oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+oldest_ts = 0
+if #oldest > 0 then oldest_ts = tonumber(oldest[2]) end
+return {1, count, oldest_ts}
 """
 
     # Token bucket: HMGET {tokens, last_refill}, refill proportionally, consume 1.
@@ -514,14 +546,16 @@ return {allowed, math.floor(tokens), time_to_next}
 
     async def _allow_sliding(self, client: Any, redis_key: str, count: int, window_seconds: int) -> tuple[bool, int, int, dict[str, Any]]:
         now = time.time()
-        result = await client.eval(self._LUA_SLIDING, 1, redis_key, now, window_seconds)
-        current_count = int(result[0])
-        oldest_ts = float(result[1]) if result[1] else now
+        unique_member = f"{now}:{uuid.uuid4().hex}"
+        result = await client.eval(self._LUA_SLIDING, 1, redis_key, now, window_seconds, count, unique_member)
+        allowed_int = int(result[0])
+        current_count = int(result[1])
+        oldest_ts = float(result[2]) if result[2] else now
         reset_timestamp = int(oldest_ts + window_seconds)
         reset_in = max(0, int(reset_timestamp - now))
         remaining = max(0, count - current_count)
 
-        if current_count > count:
+        if not allowed_int:
             return False, count, reset_timestamp, {"limited": True, "remaining": 0, "reset_in": reset_in}
         return True, count, reset_timestamp, {"limited": True, "remaining": remaining, "reset_in": reset_in}
 
@@ -620,8 +654,8 @@ class RateLimiterPlugin(Plugin):
     async def prompt_pre_fetch(self, payload: PromptPrehookPayload, context: PluginContext) -> PromptPrehookResult:
         try:
             prompt = payload.prompt_id
-            user = context.global_context.user or "anonymous"
-            tenant = context.global_context.tenant_id or "default"
+            user = _extract_user_identity(context.global_context.user)
+            tenant = (str(context.global_context.tenant_id).strip() if context.global_context.tenant_id else "") or "default"
 
             results = [
                 await self._rate_backend.allow(f"user:{user}", self._cfg.by_user),
@@ -661,9 +695,9 @@ class RateLimiterPlugin(Plugin):
 
     async def tool_pre_invoke(self, payload: ToolPreInvokePayload, context: PluginContext) -> ToolPreInvokeResult:
         try:
-            tool = payload.name
-            user = context.global_context.user or "anonymous"
-            tenant = context.global_context.tenant_id or "default"
+            tool = payload.name.strip().lower()
+            user = _extract_user_identity(context.global_context.user)
+            tenant = (str(context.global_context.tenant_id).strip() if context.global_context.tenant_id else "") or "default"
 
             results = [
                 await self._rate_backend.allow(f"user:{user}", self._cfg.by_user),
@@ -672,8 +706,10 @@ class RateLimiterPlugin(Plugin):
 
             by_tool_config = self._cfg.by_tool
             if by_tool_config:
-                if hasattr(by_tool_config, "__contains__") and tool in by_tool_config:  # pylint: disable=unsupported-membership-test
-                    results.append(await self._rate_backend.allow(f"tool:{tool}", by_tool_config[tool]))
+                # Normalise config keys to lowercase so lookup matches the normalised tool name.
+                normalised_by_tool = {k.strip().lower(): v for k, v in by_tool_config.items()}  # pylint: disable=unsupported-membership-test
+                if tool in normalised_by_tool:
+                    results.append(await self._rate_backend.allow(f"tool:{tool}", normalised_by_tool[tool]))
 
             allowed, limit, remaining, reset_ts, meta = _select_most_restrictive(results)
             retry_after = meta.get("reset_in", 0)

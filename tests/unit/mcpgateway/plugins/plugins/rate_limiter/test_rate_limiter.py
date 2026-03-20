@@ -1414,16 +1414,6 @@ async def test_bypass_none_user_falls_back_to_anonymous_bucket():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Gap: whitespace-only user identity (e.g. '   ') is truthy so it does NOT "
-        "resolve to 'anonymous'. It creates its own bucket 'user:   ', separate from "
-        "the anonymous bucket and from real users — a caller can exhaust the anonymous "
-        "bucket and then switch to whitespace strings to get a fresh quota. "
-        "Fix: strip and normalise user identity before using it as a bucket key."
-    ),
-)
 @pytest.mark.asyncio
 async def test_bypass_whitespace_user_shares_anonymous_bucket():
     """
@@ -1451,14 +1441,6 @@ async def test_bypass_whitespace_user_shares_anonymous_bucket():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Gap: by_tool matching is case-sensitive (exact dict key lookup). "
-        "A caller can bypass a per-tool limit on 'search' by calling 'Search' or 'SEARCH'. "
-        "Fix: normalise tool names to lowercase before matching against by_tool keys."
-    ),
-)
 @pytest.mark.asyncio
 async def test_bypass_tool_name_case_sensitivity():
     """
@@ -1490,15 +1472,6 @@ async def test_bypass_tool_name_case_sensitivity():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Gap: by_tool matching uses exact string comparison. A tool name with a "
-        "leading or trailing space (' search') does not match the configured key "
-        "('search') and gets an unlimited quota. "
-        "Fix: strip tool names before matching against by_tool keys."
-    ),
-)
 @pytest.mark.asyncio
 async def test_bypass_tool_name_whitespace():
     """
@@ -2425,49 +2398,40 @@ def test_by_tool_with_special_character_tool_names():
 # ============================================================================
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Bug: _LUA_SLIDING uses ZADD key score member where both score and member "
-        "are the same float timestamp. Redis ZADD with duplicate member overwrites "
-        "the existing entry, collapsing N requests at the same timestamp into 1. "
-        "Fix: use a unique member per request (e.g. UUID or counter suffix) so "
-        "each request occupies its own sorted-set slot regardless of timestamp."
-    ),
-)
 @pytest.mark.asyncio
 async def test_redis_sliding_window_counts_multiple_requests_with_same_timestamp():
     """
-    The sliding window Lua script calls ZADD key now now — timestamp is both
-    score and member. Two requests at the same float second produce only one
-    sorted-set entry, under-counting requests and allowing more than the limit.
-
-    This test sends 3 requests at an identical mocked timestamp against a limit
-    of 2/s and expects all 3 to be counted. It currently fails due to the bug.
+    The fixed sliding window Lua script uses a unique member per request
+    (ARGV[4] = uuid), so concurrent requests at the same timestamp each occupy
+    their own sorted-set slot. Three requests at an identical timestamp against
+    a limit of 2/s: first two allowed, third blocked.
     """
     from unittest.mock import AsyncMock  # noqa: PLC0415
 
     fixed_ts = 1_700_000_000.0
 
-    # Simulate Redis sorted-set behaviour: ZADD score member — duplicate member overwrites
+    # Simulate the FIXED Lua behaviour: unique member per request, check before ZADD
     store: dict[str, dict] = {}
 
     async def fake_eval(script, numkeys, key, *args):
         if "ZREMRANGEBYSCORE" in script:
-            # Sliding window Lua
             now = float(args[0])
             window = float(args[1])
+            limit_val = int(args[2])
+            member = str(args[3])  # unique member (uuid hex from _allow_sliding)
             cutoff = now - window
             if key not in store:
                 store[key] = {}
-            # Evict old entries
             store[key] = {m: s for m, s in store[key].items() if s > cutoff}
-            # ZADD: member = str(now), score = now — duplicate member overwrites
-            store[key][str(now)] = now
             count = len(store[key])
             oldest_ts = min(store[key].values()) if store[key] else 0
-            return [count, oldest_ts]
-        return [0, 0]
+            if count >= limit_val:
+                return [0, count, oldest_ts]  # [allowed=0, count, oldest_ts]
+            store[key][member] = now
+            count += 1
+            oldest_ts = min(store[key].values()) if store[key] else 0
+            return [1, count, oldest_ts]  # [allowed=1, count, oldest_ts]
+        return [0, 0, 0]
 
     mock_client = AsyncMock()
     mock_client.eval.side_effect = fake_eval
@@ -2486,11 +2450,11 @@ async def test_redis_sliding_window_counts_multiple_requests_with_same_timestamp
         r2, *_ = await backend.allow("user:test", limit)
         r3, *_ = await backend.allow("user:test", limit)
 
-    # All 3 requests share the same timestamp — with the bug only 1 entry exists
-    # so all 3 are allowed. Correct behaviour: 3rd should be blocked.
+    assert r1 is True
+    assert r2 is True
     assert r3 is False, (
         "Third request at same timestamp must be blocked — "
-        "each request must occupy its own sorted-set slot"
+        "each request now occupies its own sorted-set slot via unique member"
     )
 
 
@@ -2525,43 +2489,37 @@ async def test_sliding_window_memory_evicts_idle_keys_after_window_expires():
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Bug: _LUA_SLIDING unconditionally calls ZADD before checking the count. "
-        "This means blocked requests add their timestamp to the sorted set, inflating "
-        "the window count and causing over-blocking on subsequent requests compared to "
-        "the memory backend (which only records timestamps for allowed requests). "
-        "Fix: check count against limit BEFORE ZADD, and only insert if allowed."
-    ),
-)
 @pytest.mark.asyncio
 async def test_memory_and_redis_sliding_window_have_same_allow_block_sequence():
     """
     Memory backend and Redis backend must produce identical allow/block decisions
     for the same request timeline. This parity test uses an in-process Redis
-    simulator that faithfully implements the sliding window Lua script logic,
-    ensuring divergences between the Python algorithm and the Lua script are caught.
+    simulator that faithfully implements the fixed sliding window Lua script logic:
+    unique member per request (ARGV[4]) and count check before ZADD.
     """
     from unittest.mock import AsyncMock  # noqa: PLC0415
 
-    # In-process Redis simulator for sliding window
+    # In-process Redis simulator for the FIXED sliding window Lua script
     sim_store: dict[str, dict] = {}
-    request_counter = [0]  # unique member suffix to avoid ZADD collision
 
     async def sliding_sim(script, numkeys, key, *args):
         now = float(args[0])
         window = float(args[1])
+        limit_val = int(args[2])
+        member = str(args[3])  # unique member from _allow_sliding
         cutoff = now - window
         if key not in sim_store:
             sim_store[key] = {}
         sim_store[key] = {m: s for m, s in sim_store[key].items() if s > cutoff}
-        # Use unique member per request (correct fix — unlike the current Lua bug)
-        request_counter[0] += 1
-        sim_store[key][f"{now}:{request_counter[0]}"] = now
         count = len(sim_store[key])
         oldest_ts = min(sim_store[key].values()) if sim_store[key] else now
-        return [count, oldest_ts]
+        # Check before ZADD — blocked requests do NOT inflate the set
+        if count >= limit_val:
+            return [0, count, oldest_ts]  # [allowed=0, count, oldest_ts]
+        sim_store[key][member] = now
+        count += 1
+        oldest_ts = min(sim_store[key].values()) if sim_store[key] else now
+        return [1, count, oldest_ts]  # [allowed=1, count, oldest_ts]
 
     mock_client = AsyncMock()
     mock_client.eval.side_effect = sliding_sim
