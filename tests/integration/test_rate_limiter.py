@@ -36,6 +36,10 @@ from mcpgateway.plugins.framework import (
     PromptPrehookPayload,
     ToolPreInvokePayload,
 )
+from mcpgateway.plugins.framework.base import HookRef, PluginRef
+from mcpgateway.plugins.framework.errors import PluginViolationError
+from mcpgateway.plugins.framework.manager import PluginExecutor
+from mcpgateway.plugins.framework.models import PluginMode
 from mcpgateway.utils.create_jwt_token import _create_jwt_token
 from plugins.rate_limiter.rate_limiter import RateLimiterPlugin, _store
 
@@ -424,32 +428,428 @@ class TestStoreCleanup:
 
     @pytest.mark.asyncio
     async def test_store_cleanup_between_tests(self, rate_limit_plugin_2_per_second):
-        """Verify store is cleaned up between tests."""
-        # Store should be empty at start (autouse fixture)
-        assert len(_store) == 0
-
+        """Verify each plugin instance starts with an empty store."""
         plugin = rate_limit_plugin_2_per_second
+        backend = plugin._rate_backend
+
+        # Fresh instance — store must be empty before any requests
+        assert len(backend._algorithm._store) == 0
+
         ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
         payload = PromptPrehookPayload(prompt_id="test", args={})
 
-        # Make a request
         await plugin.prompt_pre_fetch(payload, ctx)
 
-        # Store should have entries
-        assert len(_store) > 0
+        # After one request a window entry must exist
+        assert len(backend._algorithm._store) > 0
 
     @pytest.mark.asyncio
     async def test_multiple_users_create_separate_windows(self, rate_limit_plugin_2_per_second):
-        """Verify multiple users create separate windows in store."""
+        """Verify multiple users create separate window entries in the backend store."""
         plugin = rate_limit_plugin_2_per_second
+        backend = plugin._rate_backend
 
         ctx_alice = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
         ctx_bob = PluginContext(global_context=GlobalContext(request_id="r2", user="bob"))
         payload = PromptPrehookPayload(prompt_id="test", args={})
 
-        # Make requests from both users
         await plugin.prompt_pre_fetch(payload, ctx_alice)
         await plugin.prompt_pre_fetch(payload, ctx_bob)
 
-        # Store should have entries for both users
-        assert len(_store) >= 2
+        # Each user must have their own key in the store
+        assert len(backend._algorithm._store) >= 2
+
+
+class TestSlidingWindowIntegration:
+    """End-to-end integration tests for the sliding_window algorithm."""
+
+    @pytest.fixture
+    def plugin(self):
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["prompt_pre_fetch", "tool_pre_invoke"],
+            priority=100,
+            config={"by_user": "3/s", "algorithm": "sliding_window"},
+        )
+        return RateLimiterPlugin(config)
+
+    @pytest.mark.asyncio
+    async def test_sliding_window_enforces_limit(self, plugin):
+        """Sliding window allows exactly N requests then blocks."""
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(3):
+            result = await plugin.tool_pre_invoke(payload, ctx)
+            assert result.violation is None
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is not None
+        assert result.violation.http_status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_sliding_window_returns_ratelimit_headers(self, plugin):
+        """Sliding window includes X-RateLimit-* headers on allowed requests."""
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is None
+        assert result.http_headers is not None
+        assert "X-RateLimit-Limit" in result.http_headers
+        assert "X-RateLimit-Remaining" in result.http_headers
+        assert "X-RateLimit-Reset" in result.http_headers
+        assert "Retry-After" not in result.http_headers
+
+    @pytest.mark.asyncio
+    async def test_sliding_window_retry_after_on_violation(self, plugin):
+        """Sliding window includes Retry-After on violations."""
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(3):
+            await plugin.tool_pre_invoke(payload, ctx)
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is not None
+        assert "Retry-After" in result.violation.http_headers
+
+    @pytest.mark.asyncio
+    async def test_sliding_window_resets_after_window(self, plugin):
+        """Sliding window allows requests again after the window elapses."""
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(3):
+            await plugin.tool_pre_invoke(payload, ctx)
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is not None
+
+        await asyncio.sleep(1.1)
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is None
+
+    @pytest.mark.asyncio
+    async def test_sliding_window_independent_users(self, plugin):
+        """Sliding window tracks separate counters per user."""
+        ctx_alice = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        ctx_bob = PluginContext(global_context=GlobalContext(request_id="r2", user="bob"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(3):
+            await plugin.tool_pre_invoke(payload, ctx_alice)
+
+        alice_blocked = await plugin.tool_pre_invoke(payload, ctx_alice)
+        assert alice_blocked.violation is not None
+
+        bob_allowed = await plugin.tool_pre_invoke(payload, ctx_bob)
+        assert bob_allowed.violation is None
+
+
+class TestTokenBucketIntegration:
+    """End-to-end integration tests for the token_bucket algorithm."""
+
+    @pytest.fixture
+    def plugin(self):
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["prompt_pre_fetch", "tool_pre_invoke"],
+            priority=100,
+            config={"by_user": "3/s", "algorithm": "token_bucket"},
+        )
+        return RateLimiterPlugin(config)
+
+    @pytest.mark.asyncio
+    async def test_token_bucket_enforces_limit(self, plugin):
+        """Token bucket allows up to capacity requests then blocks."""
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(3):
+            result = await plugin.tool_pre_invoke(payload, ctx)
+            assert result.violation is None
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is not None
+        assert result.violation.http_status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_token_bucket_returns_ratelimit_headers(self, plugin):
+        """Token bucket includes X-RateLimit-* headers on allowed requests."""
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is None
+        assert result.http_headers is not None
+        assert "X-RateLimit-Limit" in result.http_headers
+        assert "X-RateLimit-Remaining" in result.http_headers
+        assert "X-RateLimit-Reset" in result.http_headers
+
+    @pytest.mark.asyncio
+    async def test_token_bucket_remaining_decrements(self, plugin):
+        """Token bucket X-RateLimit-Remaining decrements with each request."""
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        r1 = await plugin.tool_pre_invoke(payload, ctx)
+        r2 = await plugin.tool_pre_invoke(payload, ctx)
+
+        remaining1 = int(r1.http_headers["X-RateLimit-Remaining"])
+        remaining2 = int(r2.http_headers["X-RateLimit-Remaining"])
+        assert remaining2 < remaining1
+
+    @pytest.mark.asyncio
+    async def test_token_bucket_refills_over_time(self, plugin):
+        """Token bucket allows requests again after tokens refill."""
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(3):
+            await plugin.tool_pre_invoke(payload, ctx)
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is not None
+
+        await asyncio.sleep(1.1)
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is None
+
+    @pytest.mark.asyncio
+    async def test_token_bucket_independent_users(self, plugin):
+        """Token bucket tracks separate buckets per user."""
+        ctx_alice = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        ctx_bob = PluginContext(global_context=GlobalContext(request_id="r2", user="bob"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(3):
+            await plugin.tool_pre_invoke(payload, ctx_alice)
+
+        alice_blocked = await plugin.tool_pre_invoke(payload, ctx_alice)
+        assert alice_blocked.violation is not None
+
+        bob_allowed = await plugin.tool_pre_invoke(payload, ctx_bob)
+        assert bob_allowed.violation is None
+
+
+class TestCrossHookSharing:
+    """Verify that prompt_pre_fetch and tool_pre_invoke share the same rate limit counters.
+
+    Both hooks key by_user as 'user:{username}' and by_tenant as 'tenant:{tenant_id}'.
+    A user consuming quota via one hook must be counted against the same bucket
+    when using the other hook — the limit is per-identity, not per-hook.
+    """
+
+    @pytest.fixture
+    def plugin(self):
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["prompt_pre_fetch", "tool_pre_invoke"],
+            priority=100,
+            config={"by_user": "5/s"},
+        )
+        return RateLimiterPlugin(config)
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_tool_share_user_counter(self, plugin):
+        """Requests via prompt_pre_fetch and tool_pre_invoke decrement the same user bucket."""
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        prompt_payload = PromptPrehookPayload(prompt_id="p", args={})
+        tool_payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        # 3 prompt requests
+        for _ in range(3):
+            result = await plugin.prompt_pre_fetch(prompt_payload, ctx)
+            assert result.violation is None
+
+        # 2 tool requests — total 5, still within limit
+        for _ in range(2):
+            result = await plugin.tool_pre_invoke(tool_payload, ctx)
+            assert result.violation is None
+
+        # 6th request (either hook) must be blocked
+        result = await plugin.tool_pre_invoke(tool_payload, ctx)
+        assert result.violation is not None, (
+            "6th request should be blocked — prompt and tool hooks must share the same user counter"
+        )
+
+    @pytest.mark.asyncio
+    async def test_remaining_count_decrements_across_hooks(self, plugin):
+        """X-RateLimit-Remaining reflects consumption from both hooks."""
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        prompt_payload = PromptPrehookPayload(prompt_id="p", args={})
+        tool_payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        r1 = await plugin.prompt_pre_fetch(prompt_payload, ctx)
+        remaining_after_prompt = int(r1.http_headers["X-RateLimit-Remaining"])
+
+        r2 = await plugin.tool_pre_invoke(tool_payload, ctx)
+        remaining_after_tool = int(r2.http_headers["X-RateLimit-Remaining"])
+
+        assert remaining_after_tool < remaining_after_prompt, (
+            "Remaining count must decrease after a tool request following a prompt request — same shared counter"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tenant_counter_shared_across_hooks_and_users(self, plugin):
+        """Tenant bucket is shared across all users in the same tenant, regardless of hook."""
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["prompt_pre_fetch", "tool_pre_invoke"],
+            priority=100,
+            config={"by_user": "10/s", "by_tenant": "4/s"},
+        )
+        plugin = RateLimiterPlugin(config)
+
+        ctx_alice = PluginContext(global_context=GlobalContext(request_id="r1", user="alice", tenant_id="team1"))
+        ctx_bob = PluginContext(global_context=GlobalContext(request_id="r2", user="bob", tenant_id="team1"))
+
+        # Alice: 2 prompt requests
+        for _ in range(2):
+            await plugin.prompt_pre_fetch(PromptPrehookPayload(prompt_id="p", args={}), ctx_alice)
+
+        # Bob: 2 tool requests — total 4 for team1, tenant limit reached
+        for _ in range(2):
+            await plugin.tool_pre_invoke(ToolPreInvokePayload(name="tool", arguments={}), ctx_bob)
+
+        # 5th request from either user must be blocked by tenant limit
+        result = await plugin.prompt_pre_fetch(PromptPrehookPayload(prompt_id="p", args={}), ctx_alice)
+        assert result.violation is not None, (
+            "Tenant limit must be enforced across both users and both hooks"
+        )
+
+
+class TestPermissiveMode:
+    """Permissive mode logs violations but never blocks requests.
+
+    Mode enforcement is handled by PluginExecutor.execute_plugin(), not the
+    plugin itself. These tests go through PluginExecutor to exercise that path.
+    """
+
+    def _make_plugin_and_hook(self, limit: str) -> tuple:
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["tool_pre_invoke"],
+            priority=100,
+            mode=PluginMode.PERMISSIVE,
+            config={"by_user": limit},
+        )
+        plugin = RateLimiterPlugin(config)
+        hook_ref = HookRef("tool_pre_invoke", PluginRef(plugin))
+        executor = PluginExecutor(timeout=5)
+        return plugin, hook_ref, executor
+
+    @pytest.mark.asyncio
+    async def test_permissive_mode_does_not_raise_on_violation(self):
+        """PluginExecutor must not raise PluginViolationError in permissive mode."""
+        plugin, hook_ref, executor = self._make_plugin_and_hook("1/s")
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        await executor.execute_plugin(hook_ref, payload, ctx, violations_as_exceptions=True)
+
+        try:
+            result = await executor.execute_plugin(hook_ref, payload, ctx, violations_as_exceptions=True)
+        except PluginViolationError:
+            pytest.fail("PluginViolationError raised in permissive mode — should be suppressed by executor")
+
+        # Violation info is surfaced for observability but request is not blocked
+        assert result.violation is not None
+        assert result.violation.http_status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_permissive_mode_still_tracks_counters(self):
+        """Permissive mode still decrements the counter — backend store must grow."""
+        plugin, hook_ref, executor = self._make_plugin_and_hook("10/s")
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        await executor.execute_plugin(hook_ref, payload, ctx, violations_as_exceptions=True)
+        await executor.execute_plugin(hook_ref, payload, ctx, violations_as_exceptions=True)
+
+        # Counter must have been incremented — key exists in backend store
+        store = plugin._rate_backend._algorithm._store
+        assert len(store) > 0, "Permissive mode must still track counters in the backend store"
+        key = next(iter(store))
+        assert store[key].count == 2, f"Expected count=2 after 2 requests, got {store[key].count}"
+
+    @pytest.mark.asyncio
+    async def test_permissive_mode_contrast_with_enforce(self):
+        """Enforce mode raises PluginViolationError; permissive mode does not."""
+        enforce_config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["tool_pre_invoke"],
+            config={"by_user": "1/s"},
+            mode=PluginMode.ENFORCE,
+        )
+        enforce_plugin = RateLimiterPlugin(enforce_config)
+        enforce_ref = HookRef("tool_pre_invoke", PluginRef(enforce_plugin))
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+        executor = PluginExecutor(timeout=5)
+
+        await executor.execute_plugin(enforce_ref, payload, ctx, violations_as_exceptions=True)
+
+        with pytest.raises(PluginViolationError):
+            await executor.execute_plugin(enforce_ref, payload, ctx, violations_as_exceptions=True)
+
+
+class TestDisabledMode:
+    """Disabled mode — PluginExecutor.execute() skips the plugin entirely.
+
+    The disabled check lives in execute() (batch), not execute_plugin() (single),
+    so tests must go through execute() with a list of hook_refs.
+    """
+
+    def _make_plugin_and_refs(self) -> tuple:
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["tool_pre_invoke"],
+            priority=100,
+            mode=PluginMode.DISABLED,
+            config={"by_user": "1/s"},
+        )
+        plugin = RateLimiterPlugin(config)
+        hook_ref = HookRef("tool_pre_invoke", PluginRef(plugin))
+        executor = PluginExecutor(timeout=5)
+        return plugin, [hook_ref], executor
+
+    @pytest.mark.asyncio
+    async def test_disabled_mode_never_blocks(self):
+        """execute() skips a disabled plugin — no violation ever returned."""
+        plugin, hook_refs, executor = self._make_plugin_and_refs()
+        global_ctx = GlobalContext(request_id="r1", user="alice")
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(10):
+            result, _ = await executor.execute(hook_refs, payload, global_ctx, "tool_pre_invoke", violations_as_exceptions=True)
+            assert result.violation is None, "Disabled plugin must never produce a violation"
+
+    @pytest.mark.asyncio
+    async def test_disabled_mode_does_not_track_counters(self):
+        """execute() skips the plugin — backend store must remain empty."""
+        plugin, hook_refs, executor = self._make_plugin_and_refs()
+        global_ctx = GlobalContext(request_id="r1", user="alice")
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(5):
+            await executor.execute(hook_refs, payload, global_ctx, "tool_pre_invoke", violations_as_exceptions=True)
+
+        assert len(plugin._rate_backend._algorithm._store) == 0, (
+            "Disabled plugin must not write to the backend store — executor skips it entirely"
+        )
+
+    def test_disabled_plugin_mode_property(self):
+        """Plugin mode property reflects the configured disabled mode."""
+        plugin, _, _ = self._make_plugin_and_refs()
+        assert plugin.mode == PluginMode.DISABLED
