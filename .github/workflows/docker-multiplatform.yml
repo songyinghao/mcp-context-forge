@@ -74,20 +74,17 @@ jobs:
             runner: ubuntu-24.04-arm
             suffix: arm64
             cache_mode: max
-            run_on_pr: true
+            run_on_pr: false
           - platform: linux/s390x
             runner: ubuntu-24.04-s390x
             suffix: s390x
-            # qemu: true
             cache_mode: max
-            run_on_pr: true
+            run_on_pr: false
           - platform: linux/ppc64le
             runner: ubuntu-24.04-ppc64le
             suffix: ppc64le
-            # qemu: true
             cache_mode: max
-            run_on_pr: true
-            # tag_only: true    # Only build on tagged releases (QEMU is slow)
+            run_on_pr: false
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
