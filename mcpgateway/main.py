@@ -35,9 +35,11 @@ from functools import lru_cache
 import hashlib
 import hmac
 import html
+import json
+import logging
 import re
 import sys
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, TypeAlias, Union
 from urllib.parse import urlparse, urlunparse
 import uuid
 import warnings
@@ -1300,6 +1302,11 @@ def _apply_runtime_mode_headers(response: Response) -> None:
     response.headers["x-contextforge-mcp-session-auth-reuse-mode"] = _current_mcp_session_auth_reuse_mode()
 
 
+# Type aliases for improved readability
+ToolsResponse: TypeAlias = Union[List[ToolRead], CursorPaginatedToolsResponse, List[Dict[Any, Any]], Dict[Any, Any], ORJSONResponse]
+ToolResponse: TypeAlias = Union[ToolRead, Dict[Any, Any], ORJSONResponse]
+
+
 @lru_cache(maxsize=512)
 def _parse_jsonpath(jsonpath: str) -> JSONPath:
     """Cache parsed JSONPath expression.
@@ -1314,6 +1321,73 @@ def _parse_jsonpath(jsonpath: str) -> JSONPath:
         Exception: If the JSONPath expression is invalid.
     """
     return parse(jsonpath)
+
+
+def _parse_apijsonpath(raw: Optional[Union[str, JsonPathModifier]]) -> Optional[JsonPathModifier]:
+    """
+    Parse apijsonpath parameter from either a JSON string or a JsonPathModifier model.
+
+    Performs early validation of JSONPath syntax to fail fast and provide clear error messages.
+
+    Args:
+        raw: Either a JSON-encoded string or a JsonPathModifier instance
+
+    Returns:
+        Parsed JsonPathModifier or None if raw is None
+
+    Raises:
+        HTTPException: If the JSON string is invalid, unexpected type provided,
+                      jsonpath expression is empty, or JSONPath syntax is invalid (400 Bad Request)
+    """
+    if raw is None:
+        return None
+
+    if isinstance(raw, str):
+        try:
+            parsed = JsonPathModifier.model_validate(json.loads(raw))
+            # Validate jsonpath is not empty if provided
+            if parsed.jsonpath is not None:
+                if not parsed.jsonpath.strip():
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="JSONPath expression cannot be empty")
+                # Early validation: ensure JSONPath syntax is valid
+                try:
+                    _parse_jsonpath(parsed.jsonpath)
+                except Exception as parse_ex:
+                    detail = f"Invalid JSONPath syntax: {parse_ex}" if settings.log_level == "DEBUG" else "Invalid JSONPath expression"
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+            return parsed
+        except HTTPException:
+            # Re-raise HTTPException as-is (includes empty jsonpath and syntax validation)
+            raise
+        except json.JSONDecodeError as ex:
+            # User error: malformed JSON (JSONDecodeError is subclass of ValueError, so catch it specifically)
+            detail = f"Invalid apijsonpath JSON: {ex}" if settings.log_level == "DEBUG" else "Invalid apijsonpath format"
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        except ValidationError as ex:
+            # Pydantic validation error
+            detail = f"Invalid apijsonpath structure: {ex}" if settings.log_level == "DEBUG" else "Invalid apijsonpath structure"
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        except Exception as ex:
+            # Unexpected error - log it and return generic message
+            logger.error(f"Unexpected error parsing apijsonpath: {ex}", exc_info=True)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to parse apijsonpath")
+    elif isinstance(raw, JsonPathModifier):
+        # Validate jsonpath is not empty if provided
+        if raw.jsonpath is not None:
+            if not raw.jsonpath.strip():
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="JSONPath expression cannot be empty")
+            # Early validation: ensure JSONPath syntax is valid
+            try:
+                _parse_jsonpath(raw.jsonpath)
+            except Exception as parse_ex:
+                detail = f"Invalid JSONPath syntax: {parse_ex}" if settings.log_level == "DEBUG" else "Invalid JSONPath expression"
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        return raw
+
+    # Unexpected type - fail fast with clear error message
+    # Only show type name in debug mode to avoid information disclosure
+    type_info = f": got {type(raw).__name__}" if settings.log_level == "DEBUG" else ""
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid apijsonpath type{type_info}")
 
 
 def jsonpath_modifier(data: Any, jsonpath: str = "$[*]", mappings: Optional[Dict[str, str]] = None) -> Union[List, Dict]:
@@ -1345,6 +1419,13 @@ def jsonpath_modifier(data: Any, jsonpath: str = "$[*]", mappings: Optional[Dict
     """
     if not jsonpath:
         jsonpath = "$[*]"
+
+    # Log jsonpath_modifier invocation with structured data (only if debug enabled)
+    if logger.isEnabledFor(logging.DEBUG):
+        data_length = len(data) if isinstance(data, list) else None
+        logger.debug(
+            f"jsonpath_modifier: path='{SecurityValidator.sanitize_log_message(jsonpath)}', has_mappings={mappings is not None}, " f"data_type={type(data).__name__}, data_length={data_length}"
+        )
 
     try:
         main_expr: JSONPath = _parse_jsonpath(jsonpath)
@@ -1682,9 +1763,6 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # For plugin errors, exit cleanly without stack trace spam
         if "Plugin initialization failed" in str(e):
             # Suppress uvicorn error logging for clean exit
-            # Standard
-            import logging  # pylint: disable=import-outside-toplevel
-
             logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
             raise SystemExit(1)
         raise
@@ -3438,6 +3516,7 @@ async def list_servers(
     include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
     limit: Optional[int] = Query(None, ge=0, description="Maximum number of servers to return"),
     include_inactive: bool = False,
+    include_metrics: bool = False,
     tags: Optional[str] = None,
     team_id: Optional[str] = None,
     visibility: Optional[str] = None,
@@ -3453,6 +3532,7 @@ async def list_servers(
         include_pagination (bool): Include cursor pagination metadata in response.
         limit (Optional[int]): Maximum number of servers to return.
         include_inactive (bool): Whether to include inactive servers in the response.
+        include_metrics (bool): Whether to include aggregated metrics in the response.
         tags (Optional[str]): Comma-separated list of tags to filter by.
         team_id (Optional[str]): Filter by specific team ID.
         visibility (Optional[str]): Filter by visibility (private, team, public).
@@ -3501,6 +3581,7 @@ async def list_servers(
         cursor=cursor,
         limit=limit,
         include_inactive=include_inactive,
+        include_metrics=include_metrics,
         tags=tags_list,
         user_email=None if is_admin_bypass else user_email,  # Admin bypass: no user filtering
         team_id=team_id,
@@ -4030,6 +4111,7 @@ async def server_get_resources(
     request: Request,
     server_id: str,
     include_inactive: bool = False,
+    include_metrics: bool = False,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> List[Dict[str, Any]]:
@@ -4044,6 +4126,7 @@ async def server_get_resources(
         request (Request): FastAPI request object.
         server_id (str): ID of the server
         include_inactive (bool): Whether to include inactive resources in the results.
+        include_metrics (bool): Whether to include aggregated metrics in the results.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
 
@@ -4059,7 +4142,9 @@ async def server_get_resources(
         token_teams = None  # Admin unrestricted
     elif token_teams is None:
         token_teams = []  # Non-admin without teams = public-only (secure default)
-    resources = await resource_service.list_server_resources(db, server_id=server_id, include_inactive=include_inactive, user_email=user_email, token_teams=token_teams)
+    resources = await resource_service.list_server_resources(
+        db, server_id=server_id, include_inactive=include_inactive, include_metrics=include_metrics, user_email=user_email, token_teams=token_teams
+    )
     return [resource.model_dump(by_alias=True) for resource in resources]
 
 
@@ -4069,6 +4154,7 @@ async def server_get_prompts(
     request: Request,
     server_id: str,
     include_inactive: bool = False,
+    include_metrics: bool = False,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> List[Dict[str, Any]]:
@@ -4083,6 +4169,7 @@ async def server_get_prompts(
         request (Request): FastAPI request object.
         server_id (str): ID of the server
         include_inactive (bool): Whether to include inactive prompts in the results.
+        include_metrics (bool): Whether to include aggregated metrics in the results.
         db (Session): Database session dependency.
         user (str): Authenticated user dependency.
 
@@ -4098,7 +4185,7 @@ async def server_get_prompts(
         token_teams = None  # Admin unrestricted
     elif token_teams is None:
         token_teams = []  # Non-admin without teams = public-only (secure default)
-    prompts = await prompt_service.list_server_prompts(db, server_id=server_id, include_inactive=include_inactive, user_email=user_email, token_teams=token_teams)
+    prompts = await prompt_service.list_server_prompts(db, server_id=server_id, include_inactive=include_inactive, include_metrics=include_metrics, user_email=user_email, token_teams=token_teams)
     return [prompt.model_dump(by_alias=True) for prompt in prompts]
 
 
@@ -4569,9 +4656,9 @@ async def list_tools(
     visibility: Optional[str] = Query(None, description="Filter by visibility: private, team, public"),
     gateway_id: Optional[str] = Query(None, description="Filter by gateway ID"),
     db: Session = Depends(get_db),
-    apijsonpath: JsonPathModifier = Body(None),
+    apijsonpath: Optional[str] = Query(None, description="Optional JSONPath modifier as JSON string"),
     user=Depends(get_current_user_with_permissions),
-) -> Union[List[ToolRead], List[Dict], Dict]:
+) -> ToolsResponse:
     """List all registered tools with team-based filtering and pagination support.
 
     Args:
@@ -4586,12 +4673,21 @@ async def list_tools(
         visibility: Optional visibility filter (private, team, public)
         gateway_id: Optional gateway ID to filter tools by specific gateway
         db: Database session
-        apijsonpath: JSON path modifier to filter or transform the response
+        apijsonpath: Optional JSON-Path modifier supplied as URL-encoded query parameter.
+                     Example: ?apijsonpath=%7B%22jsonpath%22%3A%22%24.name%22%7D
+                     (decoded: {"jsonpath":"$.name"})
+                     Use to filter or transform the response via JSONPath expressions.
         user: Authenticated user with permissions
 
     Returns:
         List of tools or modified result based on jsonpath
+
+    Raises:
+        HTTPException: If JSONPath modifier fails to process the tools list
     """
+
+    # Validate apijsonpath early — fail fast before the database query
+    parsed_apijsonpath = _parse_apijsonpath(apijsonpath)
 
     # Parse tags parameter if provided
     tags_list = None
@@ -4646,14 +4742,29 @@ async def list_tools(
     db.commit()
     db.close()
 
-    if apijsonpath is None:
+    if parsed_apijsonpath is None:
         if include_pagination:
             return CursorPaginatedToolsResponse.model_construct(tools=data, next_cursor=next_cursor)
         return data
 
     tools_dict_list = [tool.to_dict(use_alias=True) for tool in data]
+    try:
+        result = jsonpath_modifier(tools_dict_list, parsed_apijsonpath.jsonpath, parsed_apijsonpath.mapping)
 
-    return jsonpath_modifier(tools_dict_list, apijsonpath.jsonpath, apijsonpath.mapping)
+        # If pagination is requested, wrap the result with cursor metadata.
+        # Use "nextCursor" to match the CursorPaginatedToolsResponse alias contract.
+        if include_pagination:
+            paginated_result = {"tools": result, "nextCursor": next_cursor}
+            return ORJSONResponse(content=paginated_result)
+
+        # Return ORJSONResponse to bypass FastAPI's response_model validation
+        return ORJSONResponse(content=result)
+    except HTTPException:
+        # Re-raise HTTPException as-is (preserves 400 from apijsonpath parsing)
+        raise
+    except Exception:
+        logger.exception("JSONPath modifier failed while processing tools list")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="JSONPath modifier error")
 
 
 @tool_router.post("", response_model=ToolRead)
@@ -4758,8 +4869,8 @@ async def get_tool(
     request: Request,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
-    apijsonpath: JsonPathModifier = Body(None),
-) -> Union[ToolRead, Dict]:
+    apijsonpath: Optional[str] = Query(None, description="Optional JSONPath modifier as JSON string"),
+) -> ToolResponse:
     """
     Retrieve a tool by ID, optionally applying a JSONPath post-filter.
 
@@ -4768,11 +4879,15 @@ async def get_tool(
         request: The incoming HTTP request.
         db:     Active SQLAlchemy session (dependency).
         user:   Authenticated username (dependency).
-        apijsonpath: Optional JSON-Path modifier supplied in the body.
+        apijsonpath: Optional JSON-Path modifier supplied as URL-encoded query parameter.
+                     Example: ?apijsonpath=%7B%22jsonpath%22%3A%22%24.name%22%7D
+                     (decoded: {"jsonpath":"$.name","mapping":null})
+                     Use to filter or transform the response via JSONPath expressions.
 
     Returns:
         The raw ``ToolRead`` model **or** a JSON-transformed ``dict`` if
-        a JSONPath filter/mapping was supplied.
+        a JSONPath filter/mapping was supplied, **or** an ``ORJSONResponse``
+        when JSONPath modifiers are applied.
 
     Raises:
         HTTPException: If the tool does not exist or the transformation fails.
@@ -4783,12 +4898,23 @@ async def get_tool(
         _req_team_roles = get_user_team_roles(db, _req_email) if _req_email and not _req_is_admin else None
         data = await tool_service.get_tool(db, tool_id, requesting_user_email=_req_email, requesting_user_is_admin=_req_is_admin, requesting_user_team_roles=_req_team_roles)
         _enforce_scoped_resource_access(request, db, user, f"/tools/{tool_id}")
-        if apijsonpath is None:
+
+        # Parse apijsonpath parameter (handles both string and JsonPathModifier inputs)
+        parsed_apijsonpath = _parse_apijsonpath(apijsonpath)
+        if parsed_apijsonpath is None:
             return data
 
         data_dict = data.to_dict(use_alias=True)
-
-        return jsonpath_modifier(data_dict, apijsonpath.jsonpath, apijsonpath.mapping)
+        try:
+            result = jsonpath_modifier(data_dict, parsed_apijsonpath.jsonpath, parsed_apijsonpath.mapping)
+            # Return ORJSONResponse to bypass FastAPI's response_model validation
+            return ORJSONResponse(content=result)
+        except HTTPException:
+            # Re-raise HTTPException as-is (preserves 400 from apijsonpath parsing)
+            raise
+        except Exception:
+            logger.exception("JSONPath modifier failed while processing single tool")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="JSONPath modifier error")
     except HTTPException:
         raise
     except Exception as e:
@@ -10326,10 +10452,10 @@ async def export_selective_configuration(
 @require_permission("admin.import")
 async def import_configuration(
     import_data: Dict[str, Any] = Body(...),
-    conflict_strategy: str = "update",
-    dry_run: bool = False,
-    rekey_secret: Optional[str] = None,
-    selected_entities: Optional[Dict[str, List[str]]] = None,
+    conflict_strategy: str = Body("update"),
+    dry_run: bool = Body(False),
+    rekey_secret: Optional[str] = Body(None),
+    selected_entities: Optional[Dict[str, List[str]]] = Body(None),
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
 ) -> Dict[str, Any]:
@@ -10352,6 +10478,9 @@ async def import_configuration(
         HTTPException: If import fails or validation errors occur
     """
     try:
+        if not import_data:
+            raise HTTPException(status_code=400, detail="Missing 'import_data' in request body")
+
         logger.info(f"User {SecurityValidator.sanitize_log_message(str(user))} requested configuration import (dry_run={dry_run})")
 
         # Validate conflict strategy
@@ -10375,6 +10504,8 @@ async def import_configuration(
 
         return import_status.to_dict()
 
+    except HTTPException:
+        raise
     except ImportValidationError as e:
         logger.error(f"Import validation failed for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
         raise HTTPException(status_code=422, detail=f"Validation error: {str(e)}")
