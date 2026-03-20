@@ -853,3 +853,255 @@ class TestDisabledMode:
         """Plugin mode property reflects the configured disabled mode."""
         plugin, _, _ = self._make_plugin_and_refs()
         assert plugin.mode == PluginMode.DISABLED
+
+
+class TestTenantIsolation:
+    """Tenant isolation tests reflecting the real production GlobalContext path.
+
+    In production (mcpgateway/auth.py):
+      - global_context.tenant_id is always None (not derived from JWT teams)
+      - global_context.user is set as a dict {"email": ..., "is_admin": ..., "full_name": ...}
+
+    These tests document the actual behaviour of the rate limiter under those
+    conditions so that regressions are caught if the production path changes.
+    """
+
+    @pytest.fixture
+    def plugin(self):
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["tool_pre_invoke"],
+            priority=100,
+            config={"by_user": "3/s", "by_tenant": "5/s"},
+        )
+        return RateLimiterPlugin(config)
+
+    @pytest.mark.asyncio
+    async def test_user_dict_identity_is_rate_limited_independently(self, plugin):
+        """When user is a dict (production path), each distinct dict is a separate bucket.
+
+        In production global_context.user = {"email": "alice@...", "is_admin": False, ...}.
+        The rate limiter uses this dict as the key via str(dict), so two users with
+        different email addresses must have independent per-user counters.
+        """
+        alice_dict = {"email": "alice@example.com", "is_admin": False, "full_name": "Alice"}
+        bob_dict = {"email": "bob@example.com", "is_admin": False, "full_name": "Bob"}
+
+        ctx_alice = PluginContext(global_context=GlobalContext(request_id="r1", user=alice_dict))
+        ctx_bob = PluginContext(global_context=GlobalContext(request_id="r2", user=bob_dict))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(3):
+            await plugin.tool_pre_invoke(payload, ctx_alice)
+
+        alice_blocked = await plugin.tool_pre_invoke(payload, ctx_alice)
+        assert alice_blocked.violation is not None, "Alice must be blocked after exhausting her limit"
+
+        bob_allowed = await plugin.tool_pre_invoke(payload, ctx_bob)
+        assert bob_allowed.violation is None, "Bob must have an independent counter — Alice's limit must not affect him"
+
+    @pytest.mark.asyncio
+    async def test_none_tenant_id_falls_back_to_default_bucket(self, plugin):
+        """When tenant_id is None (production path), all requests share the 'default' tenant bucket.
+
+        This documents the current behaviour: by_tenant enforces a global limit
+        across ALL users when tenant_id is not explicitly set.
+        """
+        ctx_alice = PluginContext(global_context=GlobalContext(request_id="r1", user="alice", tenant_id=None))
+        ctx_bob = PluginContext(global_context=GlobalContext(request_id="r2", user="bob", tenant_id=None))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        # Alice consumes 3 requests, Bob consumes 2 — total 5, tenant limit reached
+        for _ in range(3):
+            await plugin.tool_pre_invoke(payload, ctx_alice)
+        for _ in range(2):
+            await plugin.tool_pre_invoke(payload, ctx_bob)
+
+        # 6th request from either user must be blocked by the shared tenant:default bucket
+        result = await plugin.tool_pre_invoke(payload, ctx_bob)
+        assert result.violation is not None, (
+            "When tenant_id is None both users share 'tenant:default' — 6th request must be blocked"
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_tenant_id_isolates_teams(self, plugin):
+        """When tenant_id is explicitly set, different teams have independent tenant buckets.
+
+        This is the behaviour a custom auth plugin would produce if it populates
+        global_context.tenant_id from the JWT teams claim.
+        """
+        ctx_team1 = PluginContext(global_context=GlobalContext(request_id="r1", user="alice", tenant_id="team1"))
+        ctx_team2 = PluginContext(global_context=GlobalContext(request_id="r2", user="bob", tenant_id="team2"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        # Exhaust team1's tenant limit (5/s)
+        for _ in range(5):
+            await plugin.tool_pre_invoke(payload, ctx_team1)
+
+        team1_blocked = await plugin.tool_pre_invoke(payload, ctx_team1)
+        assert team1_blocked.violation is not None, "team1 must be blocked after 5 requests"
+
+        # team2 must be unaffected — its own counter starts at 0
+        team2_allowed = await plugin.tool_pre_invoke(payload, ctx_team2)
+        assert team2_allowed.violation is None, "team2 must have its own independent tenant bucket"
+
+    @pytest.mark.asyncio
+    async def test_anonymous_user_has_separate_bucket_from_authenticated(self, plugin):
+        """Unauthenticated requests (user=None → 'anonymous') must not consume authenticated user quota."""
+        ctx_anon = PluginContext(global_context=GlobalContext(request_id="r1", user=None))
+        ctx_alice = PluginContext(global_context=GlobalContext(request_id="r2", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        # Exhaust anonymous bucket
+        for _ in range(3):
+            await plugin.tool_pre_invoke(payload, ctx_anon)
+
+        anon_blocked = await plugin.tool_pre_invoke(payload, ctx_anon)
+        assert anon_blocked.violation is not None, "Anonymous bucket must be exhausted"
+
+        # Alice must be unaffected
+        alice_allowed = await plugin.tool_pre_invoke(payload, ctx_alice)
+        assert alice_allowed.violation is None, "Authenticated user must have a separate bucket from anonymous"
+
+
+class TestNoLimitsAndMissingContext:
+    """Behaviour when no limits are configured or GlobalContext fields are absent.
+
+    These tests document the plugin's safe defaults so regressions are caught
+    if the fallback logic in prompt_pre_fetch / tool_pre_invoke changes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_limits_configured_allows_all_requests(self):
+        """Plugin with all dimensions None must allow every request without tracking."""
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["tool_pre_invoke"],
+            config={},  # no by_user, no by_tenant, no by_tool
+        )
+        plugin = RateLimiterPlugin(config)
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        for _ in range(20):
+            result = await plugin.tool_pre_invoke(payload, ctx)
+            assert result.violation is None, "Unconfigured plugin must never block"
+
+    @pytest.mark.asyncio
+    async def test_no_limits_configured_returns_no_headers(self):
+        """Plugin with no configured limits must not set X-RateLimit-* headers."""
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["tool_pre_invoke"],
+            config={},
+        )
+        plugin = RateLimiterPlugin(config)
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert not result.http_headers, (
+            "No limits configured — X-RateLimit-* headers must not be present"
+        )
+
+    @pytest.mark.asyncio
+    async def test_none_user_defaults_to_anonymous_bucket(self):
+        """user=None in GlobalContext must fall back to 'anonymous' as the rate limit key."""
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["tool_pre_invoke"],
+            config={"by_user": "2/s"},
+        )
+        plugin = RateLimiterPlugin(config)
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user=None))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        await plugin.tool_pre_invoke(payload, ctx)
+        await plugin.tool_pre_invoke(payload, ctx)
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is not None, "user=None must be treated as 'anonymous' and enforced"
+
+        # Confirm the key in the store is 'user:anonymous'
+        store = plugin._rate_backend._algorithm._store
+        assert any("anonymous" in k for k in store), (
+            "Expected 'anonymous' bucket key in store when user=None"
+        )
+
+    @pytest.mark.asyncio
+    async def test_none_tenant_id_defaults_to_default_bucket(self):
+        """tenant_id=None in GlobalContext must fall back to 'default' as the tenant key."""
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["tool_pre_invoke"],
+            config={"by_tenant": "2/s"},
+        )
+        plugin = RateLimiterPlugin(config)
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice", tenant_id=None))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        await plugin.tool_pre_invoke(payload, ctx)
+        await plugin.tool_pre_invoke(payload, ctx)
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is not None, "tenant_id=None must be treated as 'default' and enforced"
+
+        store = plugin._rate_backend._algorithm._store
+        assert any("default" in k for k in store), (
+            "Expected 'default' bucket key in store when tenant_id=None"
+        )
+
+    @pytest.mark.asyncio
+    async def test_both_user_and_tenant_none_still_enforces(self):
+        """With both user=None and tenant_id=None the plugin must still enforce limits."""
+        config = PluginConfig(
+            name="RateLimiter",
+            kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+            hooks=["tool_pre_invoke"],
+            config={"by_user": "2/s", "by_tenant": "10/s"},
+        )
+        plugin = RateLimiterPlugin(config)
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user=None, tenant_id=None))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        await plugin.tool_pre_invoke(payload, ctx)
+        await plugin.tool_pre_invoke(payload, ctx)
+
+        result = await plugin.tool_pre_invoke(payload, ctx)
+        assert result.violation is not None, (
+            "With user=None and tenant_id=None the plugin must still enforce via anonymous/default buckets"
+        )
+
+    @pytest.mark.asyncio
+    async def test_separate_plugin_instances_have_independent_stores(self):
+        """Two RateLimiterPlugin instances must never share backend state."""
+        def make_plugin():
+            return RateLimiterPlugin(PluginConfig(
+                name="RateLimiter",
+                kind="plugins.rate_limiter.rate_limiter.RateLimiterPlugin",
+                hooks=["tool_pre_invoke"],
+                config={"by_user": "2/s"},
+            ))
+
+        plugin_a = make_plugin()
+        plugin_b = make_plugin()
+
+        ctx = PluginContext(global_context=GlobalContext(request_id="r1", user="alice"))
+        payload = ToolPreInvokePayload(name="tool", arguments={})
+
+        # Exhaust plugin_a
+        await plugin_a.tool_pre_invoke(payload, ctx)
+        await plugin_a.tool_pre_invoke(payload, ctx)
+        a_blocked = await plugin_a.tool_pre_invoke(payload, ctx)
+        assert a_blocked.violation is not None
+
+        # plugin_b must be completely unaffected
+        b_allowed = await plugin_b.tool_pre_invoke(payload, ctx)
+        assert b_allowed.violation is None, (
+            "Two plugin instances must have independent stores — exhausting one must not affect the other"
+        )
