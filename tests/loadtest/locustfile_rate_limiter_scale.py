@@ -148,7 +148,7 @@ _user_counter_lock = threading.Lock()
 _user_tokens: list[str] = []
 
 # Tracks what was registered so _cleanup_users() can delete it all
-_registered_state: dict[str, Any] = {}  # {"team_id": ..., "users": [{"email":..., "token_id":...}]}
+_registered_state: dict[str, Any] = {}  # {"host": ..., "users": [{"email": ...}]}
 
 _stats_lock = threading.Lock()
 
@@ -356,17 +356,20 @@ def _admin_session(host: str) -> Any:
 
 
 def _bootstrap_users(host: str) -> None:
-    """Register N test users via the admin API and store their access tokens.
+    """Register N test users via the admin API and build per-user JWTs.
 
-    Mirrors the pattern in locustfile_mcp_isolation.py:
-      1. Create a shared team for all test users
-      2. POST /auth/email/admin/users  — register user in gateway DB
-      3. POST /teams/{id}/members      — grant team membership
-      4. POST /tokens                  — get a gateway-issued access token
+    Strategy:
+      1. Discover a virtual server with tools (admin credentials)
+      2. Register N users in the gateway DB with is_admin=True so they can
+         access public servers without needing team-scoped RBAC assignment
+      3. Build a short-lived admin JWT for each user (unique sub → unique
+         rate-limit key in Redis)
+
     Tokens are stored in _user_tokens[i] for ScaleComparisonUser to pick up.
     """
     global _user_tokens, _registered_state, _server_id, _tool_names  # pylint: disable=global-statement
 
+    from mcpgateway.utils.create_jwt_token import _create_jwt_token  # pylint: disable=import-outside-toplevel
     import requests  # pylint: disable=import-outside-toplevel
 
     admin = _admin_session(host)
@@ -398,19 +401,8 @@ def _bootstrap_users(host: str) -> None:
             logger.warning("Tool detect failed for %s: %s", sid, exc)
 
     # ------------------------------------------------------------------
-    # 2. Create a shared team for test users
-    # ------------------------------------------------------------------
-    team_name = f"{_USER_PREFIX}-team-{uuid.uuid4().hex[:8]}"
-    resp = admin.post(f"{host}/teams/", json={
-        "name": team_name,
-        "description": "Rate limiter scale test — auto-created, will be deleted",
-        "visibility": "private",
-    }, timeout=10)
-    team_id = resp.json()["id"] if resp.status_code in (200, 201) else ""
-    logger.error("Created test team: %s (%s)", team_name, team_id)
-
-    # ------------------------------------------------------------------
-    # 3. Register N users, add to team, get gateway-issued access token
+    # 2. Register N users in the DB (is_admin=True so they can use public servers)
+    #    Build a JWT per user — each unique sub → unique rate-limit key in Redis
     # ------------------------------------------------------------------
     registered: list[dict[str, str]] = []
     tokens: list[str] = []
@@ -419,75 +411,43 @@ def _bootstrap_users(host: str) -> None:
     for i in range(RL_USERS):
         email = f"{_USER_PREFIX}-{run_id}-{i:04d}@loadtest.internal"
         try:
-            # Register user in gateway DB
             r = admin.post(f"{host}/auth/email/admin/users", json={
                 "email": email,
                 "password": _TEST_PASSWORD,
                 "full_name": f"Scale Test User {i:04d}",
-                "is_admin": False,
+                "is_admin": True,
                 "is_active": True,
                 "password_change_required": False,
             }, timeout=10)
             if r.status_code not in (200, 201):
                 logger.warning("User registration failed for %s: %s %s", email, r.status_code, r.text[:200])
                 tokens.append("")
-                registered.append({"email": email, "token_id": ""})
+                registered.append({"email": email})
                 continue
 
-            # Add to team
-            if team_id:
-                admin.post(f"{host}/teams/{team_id}/members",
-                           json={"email": email, "role": "member"}, timeout=10)
-
-            # Get a gateway-issued access token using a short-lived JWT for this user
-            from mcpgateway.utils.create_jwt_token import _create_jwt_token  # pylint: disable=import-outside-toplevel
             user_jwt = _create_jwt_token(
                 {"sub": email},
-                user_data={"email": email, "is_admin": False, "auth_provider": "local"},
-                teams=[team_id] if team_id else [],
+                user_data={"email": email, "is_admin": True, "auth_provider": "local"},
+                teams=None,
                 secret=JWT_SECRET_KEY,
             )
-            user_session = requests.Session()
-            user_session.headers.update({
-                "Authorization": f"Bearer {user_jwt}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            })
-            token_payload: dict[str, Any] = {
-                "name": f"{_USER_PREFIX}-tok-{run_id}-{i:04d}",
-                "expires_in_days": 1,
-            }
-            if team_id:
-                token_payload["team_id"] = team_id
-            tr = user_session.post(f"{host}/tokens", json=token_payload, timeout=10)
-            if tr.status_code not in (200, 201):
-                logger.warning("Token creation failed for %s: %s %s", email, tr.status_code, tr.text[:200])
-                tokens.append("")
-                registered.append({"email": email, "token_id": ""})
-                continue
-
-            token_data = tr.json()
-            access_token = token_data.get("access_token", "")
-            token_obj = token_data.get("token", token_data)
-            token_id = token_obj.get("id") or token_obj.get("token_id", "")
-
-            tokens.append(access_token)
-            registered.append({"email": email, "token_id": token_id})
+            tokens.append(user_jwt)
+            registered.append({"email": email})
 
         except Exception as exc:
             logger.warning("Bootstrap failed for user %d (%s): %s", i, email, exc)
             tokens.append("")
-            registered.append({"email": email, "token_id": ""})
+            registered.append({"email": email})
 
     _user_tokens = tokens
-    _registered_state = {"team_id": team_id, "host": host, "users": registered}
+    _registered_state = {"host": host, "users": registered}
 
     valid = sum(1 for t in tokens if t)
     logger.error("Bootstrap complete: %d/%d users registered with valid tokens", valid, RL_USERS)
 
 
 def _cleanup_users() -> None:
-    """Delete all test users, their tokens, and the test team."""
+    """Delete all test users registered during bootstrap."""
     if not _registered_state:
         return
 
@@ -495,32 +455,17 @@ def _cleanup_users() -> None:
     if not host:
         return
 
-    import requests  # pylint: disable=import-outside-toplevel
-
     admin = _admin_session(host)
 
     for user in _registered_state.get("users", []):
-        token_id = user.get("token_id")
         email = user.get("email", "")
-        if token_id:
-            try:
-                admin.delete(f"{host}/tokens/admin/{token_id}", timeout=10)
-            except Exception:
-                pass
         if email:
             try:
                 admin.delete(f"{host}/auth/email/admin/users/{email}", timeout=10)
             except Exception:
                 pass
 
-    team_id = _registered_state.get("team_id")
-    if team_id:
-        try:
-            admin.delete(f"{host}/teams/{team_id}", timeout=10)
-        except Exception:
-            pass
-
-    logger.error("Cleanup complete: deleted %d users and team %s", len(_registered_state.get("users", [])), team_id)
+    logger.error("Cleanup complete: deleted %d users", len(_registered_state.get("users", [])))
 
 
 # =============================================================================
