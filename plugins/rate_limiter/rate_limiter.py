@@ -68,10 +68,13 @@ def _parse_rate(rate: str) -> tuple[int, int]:
         Tuple of (count, window_seconds) for the rate limit.
 
     Raises:
-        ValueError: If the rate unit is not supported.
+        ValueError: If the rate string is malformed or the unit is not supported.
     """
-    count_str, per = rate.split("/")
-    count = int(count_str)
+    try:
+        count_str, per = rate.split("/", maxsplit=1)
+        count = int(count_str)
+    except (ValueError, AttributeError):
+        raise ValueError(f"Invalid rate string {rate!r}: expected '<count>/<unit>' e.g. '60/m'")
     per = per.strip().lower()
     if per in ("s", "sec", "second"):
         return count, 1
@@ -79,7 +82,7 @@ def _parse_rate(rate: str) -> tuple[int, int]:
         return count, 60
     if per in ("h", "hr", "hour"):
         return count, 3600
-    raise ValueError(f"Unsupported rate unit: {per}")
+    raise ValueError(f"Invalid rate string {rate!r}: unsupported unit {per!r}, expected s/m/h")
 
 
 def _make_headers(limit: int, remaining: int, reset_timestamp: int, retry_after: int, include_retry_after: bool = True) -> dict[str, str]:
@@ -143,8 +146,10 @@ def _select_most_restrictive(
     allowed_dims = [(allowed, limit, reset_ts, meta) for allowed, limit, reset_ts, meta in limited_results if allowed]
 
     if violated:
-        most_restrictive = min(violated, key=lambda x: x[3].get("reset_in", float("inf")))
-        _, limit, reset_ts, meta = most_restrictive
+        # Pick the violated dimension that will unblock soonest — its reset_in is the
+        # Retry-After value the client should use to know when to retry.
+        soonest_reset = min(violated, key=lambda x: x[3].get("reset_in", float("inf")))
+        _, limit, reset_ts, meta = soonest_reset
         remaining = meta.get("remaining", 0)
         retry_after = meta.get("reset_in", 0)
         aggregated_meta = {
@@ -158,8 +163,10 @@ def _select_most_restrictive(
         }
         return False, limit, remaining, reset_ts, aggregated_meta
 
-    most_restrictive = min(allowed_dims, key=lambda x: x[3].get("remaining", float("inf")))
-    _, limit, reset_ts, meta = most_restrictive
+    # All dimensions are within limit — surface the tightest one (fewest remaining
+    # requests) so headers reflect the dimension the caller is closest to exhausting.
+    tightest = min(allowed_dims, key=lambda x: x[3].get("remaining", float("inf")))
+    _, limit, reset_ts, meta = tightest
     remaining = meta.get("remaining", 0)
     retry_after = meta.get("reset_in", 0)
     aggregated_meta = {
@@ -579,11 +586,17 @@ return {allowed, math.floor(tokens), time_to_next}
         allowed_int = int(result[0])
         remaining = int(result[1])
         time_to_next = int(result[2])
-        reset_timestamp = int(now + (time_to_next if not allowed_int else window_seconds))
 
         if not allowed_int:
+            reset_timestamp = int(now + time_to_next)
             return False, count, reset_timestamp, {"limited": True, "remaining": 0, "reset_in": time_to_next}
-        return True, count, reset_timestamp, {"limited": True, "remaining": remaining, "reset_in": window_seconds}
+
+        # Compute time-to-full consistent with the memory backend: tokens_needed / refill_rate.
+        # Use max(1, ...) so sub-second refill times round up to a future integer timestamp.
+        tokens_needed = count - remaining
+        time_to_full = max(1, int(tokens_needed / refill_rate)) if tokens_needed > 0 else 0
+        reset_timestamp = int(now + time_to_full)
+        return True, count, reset_timestamp, {"limited": True, "remaining": remaining, "reset_in": time_to_full}
 
 
 # ---------------------------------------------------------------------------
@@ -666,10 +679,17 @@ class RateLimiterPlugin(Plugin):
         if errors:
             raise ValueError("RateLimiterPlugin config errors: " + "; ".join(errors))
 
+        # Pre-compute normalised by_tool keys once — used on every hook call.
+        self._normalised_by_tool: Dict[str, str] = (
+            {k.strip().lower(): v for k, v in self._cfg.by_tool.items()}
+            if self._cfg.by_tool
+            else {}
+        )
+
     async def prompt_pre_fetch(self, payload: PromptPrehookPayload, context: PluginContext) -> PromptPrehookResult:
         """Enforce rate limits before a prompt is fetched."""
         try:
-            prompt = payload.prompt_id
+            prompt = payload.prompt_id.strip().lower()
             user = _extract_user_identity(context.global_context.user)
             tenant = (str(context.global_context.tenant_id).strip() if context.global_context.tenant_id else "") or "default"
 
@@ -678,9 +698,8 @@ class RateLimiterPlugin(Plugin):
                 await self._rate_backend.allow(f"tenant:{tenant}", self._cfg.by_tenant),
             ]
 
-            by_tool_config = self._cfg.by_tool
-            if by_tool_config and prompt in by_tool_config:  # pylint: disable=unsupported-membership-test
-                results.append(await self._rate_backend.allow(f"tool:{prompt}", by_tool_config[prompt]))
+            if self._normalised_by_tool and prompt in self._normalised_by_tool:
+                results.append(await self._rate_backend.allow(f"tool:{prompt}", self._normalised_by_tool[prompt]))
 
             allowed, limit, remaining, reset_ts, meta = _select_most_restrictive(results)
             retry_after = meta.get("reset_in", 0)
@@ -721,12 +740,8 @@ class RateLimiterPlugin(Plugin):
                 await self._rate_backend.allow(f"tenant:{tenant}", self._cfg.by_tenant),
             ]
 
-            by_tool_config = self._cfg.by_tool
-            if by_tool_config:
-                # Normalise config keys to lowercase so lookup matches the normalised tool name.
-                normalised_by_tool = {k.strip().lower(): v for k, v in by_tool_config.items()}  # pylint: disable=unsupported-membership-test
-                if tool in normalised_by_tool:
-                    results.append(await self._rate_backend.allow(f"tool:{tool}", normalised_by_tool[tool]))
+            if self._normalised_by_tool and tool in self._normalised_by_tool:
+                results.append(await self._rate_backend.allow(f"tool:{tool}", self._normalised_by_tool[tool]))
 
             allowed, limit, remaining, reset_ts, meta = _select_most_restrictive(results)
             retry_after = meta.get("reset_in", 0)
@@ -754,19 +769,3 @@ class RateLimiterPlugin(Plugin):
         except Exception:
             logger.exception("RateLimiterPlugin.tool_pre_invoke encountered an unexpected error; allowing request")
             return ToolPreInvokeResult()
-
-
-# ---------------------------------------------------------------------------
-# Module-level helpers — kept for test compatibility
-# ---------------------------------------------------------------------------
-
-# _store and _allow are no longer meaningful at module level since each plugin
-# instance owns its own backend. Tests should access plugin._rate_backend._algorithm._store
-# directly. These stubs are kept so existing imports don't break.
-_store: Dict[str, Any] = {}
-
-
-async def _allow(key: str, limit: Optional[str]) -> tuple[bool, int, int, dict[str, Any]]:
-    """Legacy module-level wrapper — creates a temporary MemoryBackend for the call.
-    Prefer plugin._rate_backend.allow() directly."""
-    return await MemoryBackend(FixedWindowAlgorithm()).allow(key, limit)

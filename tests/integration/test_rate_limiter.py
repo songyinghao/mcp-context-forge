@@ -41,20 +41,12 @@ from mcpgateway.plugins.framework.errors import PluginViolationError
 from mcpgateway.plugins.framework.manager import PluginExecutor
 from mcpgateway.plugins.framework.models import PluginMode
 from mcpgateway.utils.create_jwt_token import _create_jwt_token
-from plugins.rate_limiter.rate_limiter import RateLimiterPlugin, _store
+from plugins.rate_limiter.rate_limiter import RateLimiterPlugin
 
 
 # API Endpoints
 PROMPT_ENDPOINT = "/api/v1/prompts/"
 TOOL_INVOKE_ENDPOINT = "/api/v1/tools/invoke"
-
-
-@pytest.fixture(autouse=True)
-def clear_rate_limit_store():
-    """Clear rate limit store before and after each test."""
-    _store.clear()
-    yield
-    _store.clear()
 
 
 @pytest.fixture

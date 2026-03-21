@@ -576,7 +576,7 @@ class TestParseRate:
         assert _parse_rate("100/hour") == (100, 3600)
 
     def test_unsupported_unit_raises(self):
-        with pytest.raises(ValueError, match="Unsupported rate unit"):
+        with pytest.raises(ValueError, match="unsupported unit"):
             _parse_rate("10/d")
 
     def test_whitespace_stripped(self):
