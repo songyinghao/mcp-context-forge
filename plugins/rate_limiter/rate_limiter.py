@@ -371,6 +371,7 @@ class MemoryBackend:
     """
 
     def __init__(self, algorithm: FixedWindowAlgorithm | SlidingWindowAlgorithm | TokenBucketAlgorithm, sweep_interval: float = 0.5) -> None:
+        """Initialise the backend with the given algorithm and sweep interval."""
         self._algorithm = algorithm
         self._lock = asyncio.Lock()
         self._sweep_interval = sweep_interval
@@ -498,6 +499,7 @@ return {allowed, math.floor(tokens), time_to_next}
         fallback: Optional[MemoryBackend] = None,
         _client: Any = None,
     ) -> None:
+        """Initialise the Redis backend with connection URL, key prefix, algorithm, and optional fallback."""
         self._url = redis_url
         self._prefix = key_prefix
         self._algorithm_name = algorithm_name
@@ -616,6 +618,7 @@ class RateLimiterPlugin(Plugin):
     """Rate limiter with pluggable algorithm (fixed_window, sliding_window, token_bucket)."""
 
     def __init__(self, config: PluginConfig) -> None:
+        """Initialise the plugin, parse config, and set up the rate limiting backend."""
         super().__init__(config)
         self._cfg = RateLimiterConfig(**(config.config or {}))
         self._validate_config()
