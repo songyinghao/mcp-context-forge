@@ -378,6 +378,7 @@ class MemoryBackend:
         self._sweep_task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
 
     def _ensure_sweep_task(self) -> None:
+        """Start the background sweep task if it is not already running."""
         if self._sweep_task is None or self._sweep_task.done():
             try:
                 loop = asyncio.get_running_loop()
@@ -386,6 +387,7 @@ class MemoryBackend:
                 pass
 
     async def _sweep_loop(self) -> None:
+        """Periodically invoke the algorithm's sweep to evict expired entries."""
         while True:
             await asyncio.sleep(self._sweep_interval)
             await self._algorithm.sweep(self._lock)
@@ -508,6 +510,7 @@ return {allowed, math.floor(tokens), time_to_next}
         self._real_client: Any = None
 
     async def _get_client(self) -> Any:
+        """Return the Redis client, lazily initialising a real connection if needed."""
         if self._client is not None:
             return self._client
         if self._real_client is None:
@@ -539,6 +542,7 @@ return {allowed, math.floor(tokens), time_to_next}
             return True, 0, 0, {"limited": False}
 
     async def _allow_fixed(self, client: Any, redis_key: str, count: int, window_seconds: int) -> tuple[bool, int, int, dict[str, Any]]:
+        """Run the fixed-window Lua script and return the allow/block decision."""
         result = await client.eval(self._LUA_FIXED, 1, redis_key, window_seconds)
         current_count = int(result[0])
         ttl = int(result[1])
@@ -552,6 +556,7 @@ return {allowed, math.floor(tokens), time_to_next}
         return True, count, reset_timestamp, {"limited": True, "remaining": remaining, "reset_in": reset_in}
 
     async def _allow_sliding(self, client: Any, redis_key: str, count: int, window_seconds: int) -> tuple[bool, int, int, dict[str, Any]]:
+        """Run the sliding-window Lua script and return the allow/block decision."""
         now = time.time()
         unique_member = f"{now}:{uuid.uuid4().hex}"
         result = await client.eval(self._LUA_SLIDING, 1, redis_key, now, window_seconds, count, unique_member)
@@ -567,6 +572,7 @@ return {allowed, math.floor(tokens), time_to_next}
         return True, count, reset_timestamp, {"limited": True, "remaining": remaining, "reset_in": reset_in}
 
     async def _allow_token_bucket(self, client: Any, redis_key: str, count: int, window_seconds: int) -> tuple[bool, int, int, dict[str, Any]]:
+        """Run the token-bucket Lua script and return the allow/block decision."""
         now = time.time()
         refill_rate = count / window_seconds  # tokens per second
         result = await client.eval(self._LUA_TOKEN_BUCKET, 1, redis_key, count, refill_rate, now)
@@ -637,6 +643,7 @@ class RateLimiterPlugin(Plugin):
             self._rate_backend = MemoryBackend(algorithm)
 
     def _validate_config(self) -> None:
+        """Validate rate strings and algorithm/backend settings; raise ValueError on error."""
         errors: list[str] = []
 
         if self._cfg.algorithm not in VALID_ALGORITHMS:
